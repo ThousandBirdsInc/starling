@@ -44,6 +44,8 @@ struct Cli {
 enum Command {
     /// Start an instance for the current project (registers with the daemon).
     Up(UpArgs),
+    /// Stop the running instance(s) for the current project.
+    Down(DownArgs),
     /// Run the central daemon (auto-started by `up`/`dash` if not running).
     Daemon(DaemonArgs),
     /// Open the shared k9s-style TUI dashboard (default when run with no args).
@@ -97,6 +99,14 @@ struct UpArgs {
 }
 
 #[derive(Parser)]
+struct DownArgs {
+    /// Config to identify the project. Defaults to ./Starlingfile, falling back
+    /// to ./Tiltfile, matching `starling up`.
+    #[arg(long)]
+    file: Option<String>,
+}
+
+#[derive(Parser)]
 struct DaemonArgs {
     #[arg(long, default_value_t = 1360)]
     proxy_port: u16,
@@ -135,6 +145,12 @@ async fn main() {
     match Cli::parse().command {
         Some(Command::Daemon(a)) => daemon::run(a.proxy_port, a.tld, a.host, a.tls, a.lan).await,
         Some(Command::Up(a)) => up(a).await,
+        Some(Command::Down(a)) => {
+            if let Err(e) = down(a).await {
+                eprintln!("starling down: {e}");
+                std::process::exit(1);
+            }
+        }
         Some(Command::Dash(a)) => tui::run(a.proxy_port, &a.tld, a.tls).await,
         Some(Command::Trust) => {
             if let Err(e) = certs::install_trust() {
@@ -239,15 +255,85 @@ fn config_span(path: &std::path::Path) -> String {
 
 /// Infer a project name from the config file's directory.
 fn project_name(file: &PathBuf) -> String {
-    let dir = std::fs::canonicalize(file)
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_default();
+    let dir = project_dir_path(file);
     dir.file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("app")
         .to_string()
+}
+
+/// Infer the canonical project directory from the config file path.
+fn project_dir_path(file: &PathBuf) -> PathBuf {
+    std::fs::canonicalize(file)
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default()
+}
+
+fn project_dir(file: &PathBuf) -> String {
+    project_dir_path(file).display().to_string()
+}
+
+async fn down(args: DownArgs) -> anyhow::Result<()> {
+    let config_path = resolve_config(args.file.as_deref());
+    let dir = project_dir(&config_path);
+    let client = DaemonClient::new();
+    let resp = client
+        .call(&Request::ShutdownProject { dir: dir.clone() })
+        .await?;
+    let Response::ShutdownQueued { instances } = resp else {
+        anyhow::bail!("daemon returned unexpected response: {resp:?}");
+    };
+
+    if instances.is_empty() {
+        println!("No running Starling instance found for {dir}");
+        return Ok(());
+    }
+
+    let ids: Vec<String> = instances.iter().map(|i| i.id.clone()).collect();
+    println!(
+        "Stopping {} Starling instance{} for {dir}...",
+        ids.len(),
+        if ids.len() == 1 { "" } else { "s" }
+    );
+
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if instances.iter().all(|i| !pid_is_running(i.pid)) {
+            println!("Stopped.");
+            return Ok(());
+        }
+        match client.call(&Request::GetState).await {
+            Ok(Response::State(state)) => {
+                if ids
+                    .iter()
+                    .all(|id| !state.instances.iter().any(|i| &i.id == id))
+                {
+                    println!("Stopped.");
+                    return Ok(());
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+
+    anyhow::bail!(
+        "shutdown was queued, but {} instance{} did not stop within 5s",
+        ids.len(),
+        if ids.len() == 1 { "" } else { "s" }
+    )
+}
+
+fn pid_is_running(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 async fn up(args: UpArgs) {
@@ -257,6 +343,7 @@ async fn up(args: UpArgs) {
 
     let (build_tx, build_rx) = mpsc::unbounded_channel::<String>();
     let (restart_tx, restart_rx) = mpsc::unbounded_channel::<String>();
+    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
     let store = Arc::new(Store::new(build_tx.clone()));
     store.set_restart_tx(restart_tx);
 
@@ -286,10 +373,7 @@ async fn up(args: UpArgs) {
             std::process::exit(1);
         }
         let name = project_name(&config_path);
-        let dir = std::fs::canonicalize(&config_path)
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.display().to_string()))
-            .unwrap_or_default();
+        let dir = project_dir(&config_path);
         let instance = match client
             .call(&Request::Register {
                 name: name.clone(),
@@ -366,6 +450,7 @@ async fn up(args: UpArgs) {
     // Reporter: push state to the daemon and execute queued commands.
     if let Some((client, instance)) = daemon_instance.clone() {
         let store = store.clone();
+        let shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(1000));
             loop {
@@ -395,6 +480,10 @@ async fn up(args: UpArgs) {
                             }
                             DaemonCommand::Restart { resource } => {
                                 let _ = store.restart(&resource);
+                            }
+                            DaemonCommand::Shutdown => {
+                                let _ = shutdown_tx.send(());
+                                return;
                             }
                         }
                     }
@@ -428,7 +517,10 @@ async fn up(args: UpArgs) {
 
     println!("starling up running — open the dashboard with `starling`. Ctrl-C to stop.");
 
-    let _ = tokio::signal::ctrl_c().await;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = shutdown_rx.recv() => {}
+    }
     if let Some((client, instance)) = daemon_instance {
         let _ = client.call(&Request::Deregister { instance }).await;
     }

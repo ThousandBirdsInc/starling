@@ -308,6 +308,18 @@ impl Daemon {
                     Response::Error(format!("unknown instance {instance}"))
                 }
             }
+
+            Request::ShutdownProject { dir } => {
+                let mut inner = self.inner.lock().await;
+                let mut instances = Vec::new();
+                for inst in inner.instances.values_mut() {
+                    if inst.state.dir == dir {
+                        inst.commands.push(Command::Shutdown);
+                        instances.push(inst.state.clone());
+                    }
+                }
+                Response::ShutdownQueued { instances }
+            }
         }
     }
 

@@ -49,6 +49,10 @@ enum Mode {
     Normal,
     Filter,
     Detail,
+    /// Full-screen logs for the selected resource.
+    Logs,
+    /// Typing a log-line filter (regex) while in full-screen logs.
+    LogsFilter,
 }
 
 pub async fn run(proxy_port: u16, tld: &str, tls: bool) {
@@ -84,6 +88,8 @@ struct App {
     logs: Vec<String>,
     mode: Mode,
     filter: String,
+    /// Regex/substring filter applied to log lines (full-screen + log pane).
+    log_filter: String,
     /// Lines scrolled up from the bottom; 0 = follow tail.
     log_scroll: usize,
     status_msg: String,
@@ -92,6 +98,29 @@ struct App {
 impl App {
     fn selected(&self) -> Option<&RowItem> {
         self.table.selected().and_then(|i| self.rows.get(i))
+    }
+
+    /// Log lines for the selected resource, filtered by `log_filter`.
+    fn filtered_logs(&self) -> Vec<String> {
+        filter_log_lines(&self.logs, &self.log_filter)
+    }
+}
+
+/// Filter log lines by `pattern` (a regex; falls back to case-insensitive
+/// substring if the regex doesn't compile). Empty pattern = all lines.
+fn filter_log_lines(logs: &[String], pattern: &str) -> Vec<String> {
+    if pattern.is_empty() {
+        return logs.to_vec();
+    }
+    match regex::RegexBuilder::new(pattern).case_insensitive(true).build() {
+        Ok(re) => logs.iter().filter(|l| re.is_match(l)).cloned().collect(),
+        Err(_) => {
+            let needle = pattern.to_ascii_lowercase();
+            logs.iter()
+                .filter(|l| l.to_ascii_lowercase().contains(&needle))
+                .cloned()
+                .collect()
+        }
     }
 }
 
@@ -106,6 +135,7 @@ async fn event_loop(
         logs: vec![],
         mode: Mode::Normal,
         filter: String::new(),
+        log_filter: String::new(),
         log_scroll: 0,
         status_msg: String::new(),
     };
@@ -156,6 +186,42 @@ async fn event_loop(
                         KeyCode::Char(c) => app.filter.push(c),
                         _ => {}
                     },
+                    // Typing a log-line filter inside the full-screen log view.
+                    Mode::LogsFilter => match key.code {
+                        KeyCode::Enter => app.mode = Mode::Logs,
+                        KeyCode::Esc => {
+                            app.log_filter.clear();
+                            app.mode = Mode::Logs;
+                        }
+                        KeyCode::Backspace => {
+                            app.log_filter.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            app.log_filter.push(c);
+                            app.log_scroll = 0;
+                        }
+                        _ => {}
+                    },
+                    // Full-screen logs for the selected resource.
+                    Mode::Logs => match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('l') => {
+                            app.mode = Mode::Normal;
+                        }
+                        KeyCode::Char('/') => app.mode = Mode::LogsFilter,
+                        KeyCode::PageUp | KeyCode::Char('k') | KeyCode::Up => app.log_scroll += 5,
+                        KeyCode::PageDown | KeyCode::Char('j') | KeyCode::Down => {
+                            app.log_scroll = app.log_scroll.saturating_sub(5)
+                        }
+                        KeyCode::Char('G') | KeyCode::End => app.log_scroll = 0,
+                        KeyCode::Char('o') => {
+                            if let Some(r) = app.selected() {
+                                if !r.url.is_empty() {
+                                    let _ = open_url(&r.url);
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
                     Mode::Normal | Mode::Detail => match key.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Esc if app.mode == Mode::Detail => app.mode = Mode::Normal,
@@ -172,6 +238,10 @@ async fn event_loop(
                             } else {
                                 Mode::Detail
                             };
+                        }
+                        KeyCode::Char('l') => {
+                            app.log_scroll = 0;
+                            app.mode = Mode::Logs;
                         }
                         KeyCode::Char('/') => {
                             app.mode = Mode::Filter;
@@ -204,6 +274,19 @@ async fn event_loop(
                                 app.status_msg = format!("restarting {}", r.name);
                             }
                         }
+                        KeyCode::Char('o') => {
+                            match app.selected() {
+                                Some(r) if !r.url.is_empty() => {
+                                    let url = r.url.clone();
+                                    app.status_msg = match open_url(&url) {
+                                        Ok(()) => format!("opening {url}"),
+                                        Err(e) => format!("couldn't open {url}: {e}"),
+                                    };
+                                }
+                                Some(r) => app.status_msg = format!("{} has no URL", r.name),
+                                None => {}
+                            }
+                        }
                         _ => {}
                     },
                 }
@@ -211,6 +294,27 @@ async fn event_loop(
         }
     }
     Ok(())
+}
+
+/// Open a URL in the default browser (platform-specific opener).
+fn open_url(url: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", ""]);
+        c
+    };
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+
+    cmd.arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
 }
 
 fn move_sel(app: &mut App, delta: i32) {
@@ -290,6 +394,10 @@ fn draw(f: &mut Frame, app: &mut App) {
         draw_detail(f, app);
         return;
     }
+    if app.mode == Mode::Logs || app.mode == Mode::LogsFilter {
+        draw_logs_fullscreen(f, app);
+        return;
+    }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -360,11 +468,17 @@ fn draw(f: &mut Frame, app: &mut App) {
         .unwrap_or_else(|| "—".into());
     let h = chunks[2].height.saturating_sub(2) as usize;
     let follow = if app.log_scroll == 0 { "" } else { " (scrolled)" };
+    let logs = app.filtered_logs();
+    let filt = if app.log_filter.is_empty() {
+        String::new()
+    } else {
+        format!(" /{}", app.log_filter)
+    };
     f.render_widget(
-        Paragraph::new(log_lines(&app.logs, h, app.log_scroll)).block(
+        Paragraph::new(log_lines(&logs, h, app.log_scroll)).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Logs · {sel_name}{follow} ")),
+                .title(format!(" Logs · {sel_name}{filt}{follow} ")),
         ),
         chunks[2],
     );
@@ -375,11 +489,11 @@ fn draw(f: &mut Frame, app: &mut App) {
         " No resources. Run `starling up` in a project.   [/] filter  [q] quit ".to_string()
     } else if !app.status_msg.is_empty() {
         format!(
-            " {}   ·   [↵] detail [t] trigger [R] restart [/] filter [q] quit ",
+            " {}   ·   [↵] detail [o] open [l] logs [t] trigger [R] restart [/] filter [q] quit ",
             app.status_msg
         )
     } else {
-        " [j/k] move  [↵] detail  [t] trigger  [R] restart  [/] filter  [PgUp/Dn] logs  [q] quit "
+        " [j/k] move  [↵] detail  [l] logs  [o] open url  [t] trigger  [R] restart  [/] filter  [q] quit "
             .to_string()
     };
     f.render_widget(
@@ -443,7 +557,7 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
 
     f.render_widget(
         Paragraph::new(Span::styled(
-            " [Esc/↵] back   [t] trigger   [R] restart   [PgUp/Dn] scroll logs   [q] quit ",
+            " [Esc/↵] back  [l] full logs  [o] open url  [t] trigger  [R] restart  [PgUp/Dn] scroll  [q] quit ",
             Style::default().fg(Color::Gray),
         )),
         chunks[3],
@@ -452,4 +566,81 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
 
 fn bold() -> Style {
     Style::default().add_modifier(Modifier::BOLD)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_log_lines;
+
+    #[test]
+    fn log_filter_regex_substring_and_empty() {
+        let logs = vec![
+            "GET /healthz 200".to_string(),
+            "ERROR: connection refused".to_string(),
+            "GET /users 500".to_string(),
+        ];
+        // empty => all lines
+        assert_eq!(filter_log_lines(&logs, "").len(), 3);
+        // case-insensitive substring / regex
+        assert_eq!(filter_log_lines(&logs, "error"), vec!["ERROR: connection refused"]);
+        // regex: lines with a 5xx status
+        assert_eq!(filter_log_lines(&logs, r"\b5\d\d\b"), vec!["GET /users 500"]);
+        // invalid regex falls back to substring (no panic)
+        assert_eq!(filter_log_lines(&logs, "GET [").len(), 0);
+    }
+}
+
+/// Full-screen log view for the selected resource, with a regex filter.
+fn draw_logs_fullscreen(f: &mut Frame, app: &mut App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // title
+            Constraint::Min(3),    // logs
+            Constraint::Length(1), // footer
+        ])
+        .split(f.area());
+
+    let sel = app
+        .selected()
+        .map(|r| format!("{} / {}", r.instance_name, r.name))
+        .unwrap_or_else(|| "—".into());
+    let logs = app.filtered_logs();
+    let matched = if app.log_filter.is_empty() {
+        format!("{} lines", logs.len())
+    } else {
+        format!("{} matching lines", logs.len())
+    };
+    f.render_widget(
+        Paragraph::new(format!(" Logs · {sel}  ·  {matched} ")).style(
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        ),
+        chunks[0],
+    );
+
+    let h = chunks[1].height.saturating_sub(2) as usize;
+    f.render_widget(
+        Paragraph::new(log_lines(&logs, h, app.log_scroll))
+            .block(Block::default().borders(Borders::ALL)),
+        chunks[1],
+    );
+
+    let footer = if app.mode == Mode::LogsFilter {
+        format!(" filter /{}\u{2588}   (Enter apply · Esc clear) ", app.log_filter)
+    } else if !app.log_filter.is_empty() {
+        format!(
+            " /{}   ·   [/] edit filter  [PgUp/Dn] scroll  [o] open  [l/Esc] back  [q] quit ",
+            app.log_filter
+        )
+    } else {
+        " [/] filter (regex)  [PgUp/Dn j/k] scroll  [G] tail  [o] open url  [l/Esc] back  [q] quit "
+            .to_string()
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(footer, Style::default().fg(Color::Gray))),
+        chunks[2],
+    );
 }

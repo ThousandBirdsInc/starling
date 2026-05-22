@@ -74,6 +74,8 @@ pub enum Command {
     Trigger { resource: String },
     /// Restart a resource's serve_cmd (kill the process and start it again).
     Restart { resource: String },
+    /// Stop this `starling up` instance.
+    Shutdown,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -107,6 +109,8 @@ pub enum Request {
     Trigger { instance: String, resource: String },
     /// Dashboard: queue a serve_cmd restart for a resource on an instance.
     Restart { instance: String, resource: String },
+    /// CLI: ask every instance registered for this project directory to stop.
+    ShutdownProject { dir: String },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -117,5 +121,6 @@ pub enum Response {
     State(DashboardState),
     Logs(Vec<String>),
     Commands(Vec<Command>),
+    ShutdownQueued { instances: Vec<InstanceState> },
     Error(String),
 }

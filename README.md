@@ -1,4 +1,29 @@
-# Starling
+<p align="center">
+  <img src=".github/starling-banner.svg" alt="Starling — a murmuration of boids wheeling around the wordmark" width="820" />
+</p>
+
+<h1 align="center">Starling</h1>
+
+<p align="center">
+  A <b>local dev orchestrator</b>, written in Rust &mdash; a fork/port of
+  <a href="https://tilt.dev">Tilt</a> with <b>portless</b>-style named URLs built
+  in, <b>redesigned for scaled, agent-first engineering</b>: a central daemon, a
+  shared named-URL proxy, and a <b>k9s-style TUI</b> over every running instance.
+</p>
+
+<p align="center">
+  <a href="#why-starling--built-for-agent-first-engineering"><b>🐦 Why Starling</b></a> &middot;
+  <a href="#architecture"><b>🏛️ Architecture</b></a> &middot;
+  <a href="#running"><b>🚀 Running</b></a> &middot;
+  <a href="#named-urls-integrated-portless"><b>🔗 Named URLs</b></a> &middot;
+  <a href="#status--roadmap"><b>🗺️ Roadmap</b></a>
+</p>
+
+<p align="center">
+<a href="https://github.com/ThousandBirdsInc/starling/commits"><img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/ThousandBirdsInc/starling" /></a>
+<a href="https://crates.io/crates/starling-devex"><img alt="crates.io version" src="https://img.shields.io/crates/v/starling-devex" /></a>
+<a href="Cargo.toml"><img alt="License Apache-2.0" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" /></a>
+</p>
 
 A local dev orchestrator, written in Rust. Starling is a fork/port of
 [Tilt](https://tilt.dev) with **portless**-style named URLs built in,
@@ -134,6 +159,8 @@ cargo install starling-devex          # installs the `starling` command
 cargo run -- up                       # or: starling up
 cargo run -- up --file path/to/Starlingfile
 cargo run -- up --dry-run             # k8s applies use --dry-run=client (safe)
+cargo run -- down                     # stop the instance for this project
+cargo run -- down --file path/to/Starlingfile
 
 # Open the shared dashboard (k9s-style TUI) from anywhere:
 cargo run                             # or: starling   /   starling dash
@@ -148,10 +175,13 @@ Tilt repo with no renaming. (`--file <path>` overrides the auto-detection.)
 Starling implements Tilt's Tiltfile builtins, so most existing Tiltfiles run
 unchanged.
 
-In the **TUI**: `j`/`k` (or ↑/↓) move, `t` triggers the selected resource, `r`
-refreshes, `q` quits. The table shows every instance's resources
-(instance · resource · type · update · runtime · pod · URL) with a live log pane
-for the selection.
+In the **TUI**: `j`/`k` (or ↑/↓) move, `↵` opens a detail view, `o` opens the
+selected resource's URL in the browser, `l` opens full-screen logs, `t` triggers,
+`R` restarts, `/` filters resources, `r` refreshes, `q` quits. The table shows
+every instance's resources (instance · resource · type · update · runtime · pod ·
+URL) with a live log pane for the selection. In full-screen logs, `/` filters log
+lines by regex (case-insensitive, with substring fallback) and `PgUp`/`PgDn`
+scroll.
 
 The bundled `./Starlingfile` demonstrates `local_resource` (one-shot `cmd`,
 dependency ordering, a `serve_cmd` that gets a named URL, and `deps` file-watch

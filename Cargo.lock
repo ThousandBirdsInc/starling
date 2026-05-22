@@ -2729,7 +2729,7 @@ dependencies = [
 
 [[package]]
 name = "starling-devex"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "allocative",
  "anyhow",
@@ -2743,6 +2743,7 @@ dependencies = [
  "notify",
  "ratatui",
  "rcgen",
+ "regex",
  "rustls-pemfile",
  "serde",
  "serde_json",
