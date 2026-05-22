@@ -1,0 +1,38 @@
+# Sample Starlingfile exercising the engine + embedded named-URL proxy.
+# Run: cargo run -- up   (then open http://127.0.0.1:10360)
+#
+# Serving resources get a stable named URL via the embedded proxy, e.g.
+#   http://webserver.localhost:1360   (instead of a random localhost:PORT)
+
+print("Loading sample Starlingfile")
+
+# A one-shot build command. Edit ./watched/input.txt to trigger a rebuild.
+local_resource(
+    "compile",
+    cmd="echo compiling && cat watched/input.txt && echo done",
+    deps=["watched"],
+)
+
+# A resource that depends on another (builds after `compile`).
+local_resource(
+    "package",
+    cmd="echo packaging artifact",
+    resource_deps=["compile"],
+)
+
+# A real HTTP server. The engine assigns a free port via $PORT and the proxy
+# routes http://webserver.localhost:1360 -> 127.0.0.1:$PORT.
+local_resource(
+    "webserver",
+    serve_cmd="python3 -m http.server $PORT --bind 127.0.0.1",
+)
+
+# A long-running background process (no HTTP server).
+local_resource(
+    "heartbeat",
+    serve_cmd="while true; do echo heartbeat $(date +%S); sleep 2; done",
+)
+
+# Demonstrates running a command at load time.
+greeting = local("echo hello-from-load-time", quiet=True)
+print("local() returned: " + greeting.strip())

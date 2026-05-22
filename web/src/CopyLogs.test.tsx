@@ -1,0 +1,253 @@
+import { act, render, screen } from "@testing-library/react"
+import userEvent from "@testing-library/user-event"
+import React from "react"
+import CopyLogs, { copyLogs } from "./CopyLogs"
+import {
+  filterLogLinesForDisplay,
+  logLinesToString,
+  stripAnsiCodes,
+} from "./logs"
+import {
+  createFilterTermState,
+  EMPTY_FILTER_TERM,
+  FilterLevel,
+  FilterSet,
+  FilterSource,
+} from "./logfilters"
+import LogStore, { LogStoreProvider } from "./LogStore"
+import { StarredResourceMemoryProvider } from "./StarredResourcesContext"
+import { appendLinesForManifestAndSpan } from "./testlogs"
+import { ResourceName } from "./types"
+
+const DEFAULT_FILTER_SET: FilterSet = {
+  source: FilterSource.all,
+  level: FilterLevel.all,
+  term: EMPTY_FILTER_TERM,
+}
+
+describe("CopyLogs", () => {
+  let writeTextMock: jest.Mock
+
+  beforeEach(() => {
+    jest.useFakeTimers()
+    writeTextMock = jest.fn().mockResolvedValue(undefined)
+    Object.assign(navigator, {
+      clipboard: {
+        writeText: writeTextMock,
+      },
+    })
+  })
+
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  const createPopulatedLogStore = (): LogStore => {
+    const logStore = new LogStore()
+    appendLinesForManifestAndSpan(logStore, "", "", [
+      "global 1\n",
+      "global 2\n",
+    ])
+    appendLinesForManifestAndSpan(logStore, "vigoda", "build:m1:1", [
+      "m1:1 build line 1\n",
+    ])
+    appendLinesForManifestAndSpan(logStore, "vigoda", "pod:m1-abc123", [
+      "m1:1 runtime line 1\n",
+    ])
+    appendLinesForManifestAndSpan(logStore, "manifest2", "build:m2", [
+      "m2 build line 1\n",
+    ])
+    appendLinesForManifestAndSpan(logStore, "vigoda", "build:m1:2", [
+      "m1:2 build line 1\n",
+      "m1:2 build line 2\n",
+    ])
+    appendLinesForManifestAndSpan(logStore, "manifest2", "pod:m2-def456", [
+      "m2 runtime line 1\n",
+    ])
+    return logStore
+  }
+
+  it("copies all logs to clipboard", async () => {
+    const logStore = createPopulatedLogStore()
+    render(
+      <LogStoreProvider value={logStore}>
+        <CopyLogs
+          resourceName={ResourceName.all}
+          filterSet={DEFAULT_FILTER_SET}
+        />
+      </LogStoreProvider>
+    )
+
+    await act(async () => {
+      userEvent.click(screen.getByText("Copy"))
+    })
+
+    const expectedText = logLinesToString(logStore.allLog(), false)
+    expect(writeTextMock).toHaveBeenCalledWith(expectedText)
+  })
+
+  it("copies logs for a specific resource to clipboard", async () => {
+    const logStore = createPopulatedLogStore()
+    render(
+      <LogStoreProvider value={logStore}>
+        <CopyLogs resourceName={"vigoda"} filterSet={DEFAULT_FILTER_SET} />
+      </LogStoreProvider>
+    )
+
+    await act(async () => {
+      userEvent.click(screen.getByText("Copy"))
+    })
+
+    const expectedText = logLinesToString(logStore.manifestLog("vigoda"), true)
+    expect(writeTextMock).toHaveBeenCalledWith(expectedText)
+  })
+
+  it("does not modify the log store", async () => {
+    const logStore = createPopulatedLogStore()
+    const logsBefore = logLinesToString(logStore.allLog(), false)
+
+    render(
+      <LogStoreProvider value={logStore}>
+        <CopyLogs
+          resourceName={ResourceName.all}
+          filterSet={DEFAULT_FILTER_SET}
+        />
+      </LogStoreProvider>
+    )
+
+    await act(async () => {
+      userEvent.click(screen.getByText("Copy"))
+    })
+
+    const logsAfter = logLinesToString(logStore.allLog(), false)
+    expect(logsAfter).toEqual(logsBefore)
+  })
+
+  it("shows a tooltip with the number of copied lines", async () => {
+    const logStore = createPopulatedLogStore()
+    render(
+      <LogStoreProvider value={logStore}>
+        <CopyLogs
+          resourceName={ResourceName.all}
+          filterSet={DEFAULT_FILTER_SET}
+        />
+      </LogStoreProvider>
+    )
+
+    await act(async () => {
+      userEvent.click(screen.getByText("Copy"))
+    })
+
+    const lineCount = logStore.allLog().length
+    expect(screen.getByText(`Copied ${lineCount} lines`)).toBeInTheDocument()
+  })
+
+  it("hides the tooltip after a delay", async () => {
+    const logStore = createPopulatedLogStore()
+    render(
+      <LogStoreProvider value={logStore}>
+        <CopyLogs
+          resourceName={ResourceName.all}
+          filterSet={DEFAULT_FILTER_SET}
+        />
+      </LogStoreProvider>
+    )
+
+    await act(async () => {
+      userEvent.click(screen.getByText("Copy"))
+    })
+    const lineCount = logStore.allLog().length
+    expect(screen.getByText(`Copied ${lineCount} lines`)).toBeVisible()
+
+    // Advance past the 1500ms dismiss timeout plus MUI tooltip exit transition
+    act(() => {
+      jest.advanceTimersByTime(3000)
+    })
+
+    // After the timeout, the tooltip transitions out (opacity: 0)
+    expect(screen.queryByText(`Copied ${lineCount} lines`)).not.toBeVisible()
+  })
+
+  it("returns the number of lines copied", () => {
+    const logStore = createPopulatedLogStore()
+    const count = copyLogs(logStore, ResourceName.all, DEFAULT_FILTER_SET)
+    expect(count).toBe(logStore.allLog().length)
+  })
+
+  it("copies only the currently filtered log lines", async () => {
+    const logStore = createPopulatedLogStore()
+    const filterSet: FilterSet = {
+      ...DEFAULT_FILTER_SET,
+      term: createFilterTermState("runtime"),
+    }
+
+    render(
+      <LogStoreProvider value={logStore}>
+        <CopyLogs resourceName={ResourceName.all} filterSet={filterSet} />
+      </LogStoreProvider>
+    )
+
+    await act(async () => {
+      userEvent.click(screen.getByText("Copy"))
+    })
+
+    const expectedText = logLinesToString(
+      filterLogLinesForDisplay(logStore.allLog(), filterSet),
+      false
+    )
+    expect(writeTextMock).toHaveBeenCalledWith(expectedText)
+  })
+
+  it("copies only starred resource logs in starred view", async () => {
+    const logStore = createPopulatedLogStore()
+
+    render(
+      <StarredResourceMemoryProvider initialValueForTesting={["vigoda"]}>
+        <LogStoreProvider value={logStore}>
+          <CopyLogs
+            resourceName={ResourceName.starred}
+            filterSet={DEFAULT_FILTER_SET}
+          />
+        </LogStoreProvider>
+      </StarredResourceMemoryProvider>
+    )
+
+    await act(async () => {
+      userEvent.click(screen.getByText("Copy"))
+    })
+
+    const expectedText = logLinesToString(
+      logStore.starredLogPatchSet(["vigoda"], 0).lines,
+      true
+    )
+    expect(writeTextMock).toHaveBeenCalledWith(expectedText)
+  })
+})
+
+describe("stripAnsiCodes", () => {
+  it("removes basic color codes", () => {
+    expect(stripAnsiCodes("\x1b[31mred text\x1b[0m")).toBe("red text")
+  })
+
+  it("removes multiple ANSI sequences", () => {
+    expect(stripAnsiCodes("\x1b[1m\x1b[32mbold green\x1b[0m normal")).toBe(
+      "bold green normal"
+    )
+  })
+
+  it("removes 256-color codes", () => {
+    expect(stripAnsiCodes("\x1b[38;5;196mred\x1b[0m")).toBe("red")
+  })
+
+  it("removes OSC sequences (title setting)", () => {
+    expect(stripAnsiCodes("\x1b]0;window title\x07some text")).toBe("some text")
+  })
+
+  it("returns plain text unchanged", () => {
+    expect(stripAnsiCodes("hello world")).toBe("hello world")
+  })
+
+  it("handles empty string", () => {
+    expect(stripAnsiCodes("")).toBe("")
+  })
+})

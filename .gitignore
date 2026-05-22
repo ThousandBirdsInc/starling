@@ -1,0 +1,35 @@
+# ── Rust ───────────────────────────────────────────────────────────────────
+/target
+**/*.rs.bk
+# Cargo.lock IS committed — this is a binary/app crate, not a library.
+
+# ── Frontend (web/, Create React App + Yarn Berry) ───────────────────────────
+web/node_modules
+web/build
+web/coverage
+web/.eslintcache
+
+# Yarn Berry: ignore the cache/state, but keep the committed release binary,
+# plugins, patches, and SDKs (node-modules linker — no zero-install cache).
+web/.yarn/*
+!web/.yarn/patches
+!web/.yarn/plugins
+!web/.yarn/releases
+!web/.yarn/sdks
+!web/.yarn/versions
+web/.pnp.*
+
+# ── Starling runtime state ───────────────────────────────────────────────────
+# The daemon's socket/pid/logs/CA live in ~/.starling, but ignore any local copy.
+.starling/
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+
+# ── OS / editor cruft ────────────────────────────────────────────────────────
+.DS_Store
+*.swp
+*~
+# Root-level editor dirs only (web/.vscode is vendored from upstream Tilt).
+/.idea/
+/.vscode/

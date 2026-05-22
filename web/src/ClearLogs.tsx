@@ -1,0 +1,52 @@
+import React from "react"
+import styled from "styled-components"
+import { InstrumentedButton } from "./instrumentedComponents"
+import LogStore, { useLogStore } from "./LogStore"
+import {
+  AnimDuration,
+  Color,
+  FontSize,
+  mixinResetButtonStyle,
+} from "./style-helpers"
+import { ResourceName } from "./types"
+import type { LogSpan } from "./webview"
+
+const ClearLogsButton = styled(InstrumentedButton)`
+  ${mixinResetButtonStyle};
+  font-size: ${FontSize.small};
+  color: ${Color.white};
+  transition: color ${AnimDuration.default} ease;
+
+  &:hover {
+    color: ${Color.blue};
+  }
+`
+
+export interface ClearLogsProps {
+  resourceName: string
+}
+
+export const clearLogs = (logStore: LogStore, resourceName: string) => {
+  let spans: { [key: string]: LogSpan }
+  const all = resourceName === ResourceName.all
+  if (all) {
+    spans = logStore.allSpans()
+  } else {
+    spans = logStore.spansForManifest(resourceName)
+  }
+  logStore.removeSpans(Object.keys(spans))
+}
+
+const ClearLogs: React.FC<ClearLogsProps> = ({ resourceName }) => {
+  const logStore = useLogStore()
+  const all = resourceName == ResourceName.all
+  const label = "Clear"
+
+  return (
+    <ClearLogsButton onClick={() => clearLogs(logStore, resourceName)}>
+      {label}
+    </ClearLogsButton>
+  )
+}
+
+export default ClearLogs
