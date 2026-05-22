@@ -167,6 +167,8 @@ cargo run                             # or: starling   /   starling dash
 
 # Run the daemon explicitly (optional; up/dash auto-start it):
 cargo run -- daemon --proxy-port 1360 --tld localhost
+cargo run -- daemon --shutdown        # stop all instances and the daemon
+cargo run -- daemon --restart         # restart it, or start it if absent
 ```
 
 **Drop-in for existing Tilt projects:** `starling up` loads `./Starlingfile` if

@@ -48,6 +48,19 @@ impl DaemonClient {
 
     /// Ensure a daemon is running, spawning `starling daemon` (detached) if not.
     pub async fn ensure_running(&self, proxy_port: u16, tld: &str, tls: bool) -> Result<()> {
+        self.ensure_running_with(proxy_port, tld, "127.0.0.1", tls, false)
+            .await
+    }
+
+    /// Ensure a daemon is running, spawning `starling daemon` (detached) if not.
+    pub async fn ensure_running_with(
+        &self,
+        proxy_port: u16,
+        tld: &str,
+        host: &str,
+        tls: bool,
+        lan: bool,
+    ) -> Result<()> {
         if self.is_running().await {
             return Ok(());
         }
@@ -67,9 +80,14 @@ impl DaemonClient {
             .arg(proxy_port.to_string())
             .arg("--tld")
             .arg(tld)
+            .arg("--host")
+            .arg(host)
             .stdin(Stdio::null());
         if tls {
             cmd.arg("--tls");
+        }
+        if lan {
+            cmd.arg("--lan");
         }
         if let Some(f) = out {
             let f2 = f.try_clone().ok();

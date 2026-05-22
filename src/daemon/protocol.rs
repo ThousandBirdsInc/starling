@@ -111,6 +111,8 @@ pub enum Request {
     Restart { instance: String, resource: String },
     /// CLI: ask every instance registered for this project directory to stop.
     ShutdownProject { dir: String },
+    /// CLI: ask every instance to stop, then terminate the daemon.
+    ShutdownDaemon,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

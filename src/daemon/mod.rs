@@ -36,6 +36,7 @@ struct Inner {
     seq: u64,
     leased_ports: std::collections::HashSet<u16>,
     routes: Vec<RouteInfo>,
+    shutting_down: bool,
     /// mDNS advertiser processes (kept alive while routes are active).
     advertisers: Vec<std::process::Child>,
 }
@@ -317,6 +318,31 @@ impl Daemon {
                         inst.commands.push(Command::Shutdown);
                         instances.push(inst.state.clone());
                     }
+                }
+                Response::ShutdownQueued { instances }
+            }
+
+            Request::ShutdownDaemon => {
+                let mut inner = self.inner.lock().await;
+                let instances: Vec<InstanceState> = inner
+                    .instances
+                    .values_mut()
+                    .map(|inst| {
+                        inst.commands.push(Command::Shutdown);
+                        inst.state.clone()
+                    })
+                    .collect();
+                inner.routes.clear();
+                inner.leased_ports.clear();
+                self.resync_registry(&inner);
+                if !inner.shutting_down {
+                    inner.shutting_down = true;
+                    tokio::spawn(async {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        std::fs::remove_file(socket_path()).ok();
+                        std::fs::remove_file(pid_path()).ok();
+                        std::process::exit(0);
+                    });
                 }
                 Response::ShutdownQueued { instances }
             }

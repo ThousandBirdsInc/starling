@@ -28,7 +28,9 @@ use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
 
 use crate::daemon::client::DaemonClient;
-use crate::daemon::protocol::{Command as DaemonCommand, Request, ResourceSnapshot, Response};
+use crate::daemon::protocol::{
+    Command as DaemonCommand, InstanceState, Request, ResourceSnapshot, Response,
+};
 use crate::proxy::{ProxyConfig, ProxyHandle, ProxyRegistry};
 use crate::server::AppState;
 use crate::store::Store;
@@ -108,6 +110,15 @@ struct DownArgs {
 
 #[derive(Parser)]
 struct DaemonArgs {
+    /// Stop all running instances and terminate the daemon.
+    #[arg(long, default_value_t = false)]
+    shutdown: bool,
+    /// Restart the daemon, or start it if it is not running.
+    #[arg(long, default_value_t = false)]
+    restart: bool,
+    /// Alias for --restart.
+    #[arg(long, default_value_t = false)]
+    reload: bool,
     #[arg(long, default_value_t = 1360)]
     proxy_port: u16,
     #[arg(long, default_value = "localhost")]
@@ -143,7 +154,24 @@ async fn main() {
         .init();
 
     match Cli::parse().command {
-        Some(Command::Daemon(a)) => daemon::run(a.proxy_port, a.tld, a.host, a.tls, a.lan).await,
+        Some(Command::Daemon(a)) => {
+            if a.shutdown && (a.restart || a.reload) {
+                eprintln!("starling daemon: --shutdown cannot be combined with --restart/--reload");
+                std::process::exit(2);
+            } else if a.shutdown {
+                if let Err(e) = shutdown_daemon().await {
+                    eprintln!("starling daemon: {e}");
+                    std::process::exit(1);
+                }
+            } else if a.restart || a.reload {
+                if let Err(e) = restart_daemon(&a).await {
+                    eprintln!("starling daemon: {e}");
+                    std::process::exit(1);
+                }
+            } else {
+                daemon::run(a.proxy_port, a.tld, a.host, a.tls, a.lan).await;
+            }
+        }
         Some(Command::Up(a)) => up(a).await,
         Some(Command::Down(a)) => {
             if let Err(e) = down(a).await {
@@ -334,6 +362,67 @@ fn pid_is_running(pid: u32) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+async fn shutdown_daemon() -> anyhow::Result<()> {
+    let client = DaemonClient::new();
+    if !client.is_running().await {
+        println!("No Starling daemon is running.");
+        return Ok(());
+    }
+    let instances = request_daemon_shutdown(&client).await?;
+    println!(
+        "Stopping Starling daemon and {} instance{}...",
+        instances.len(),
+        if instances.len() == 1 { "" } else { "s" }
+    );
+    if wait_for_daemon_stop(&client, &instances).await {
+        println!("Stopped.");
+        Ok(())
+    } else {
+        anyhow::bail!("shutdown was queued, but the daemon did not stop within 8s")
+    }
+}
+
+async fn restart_daemon(args: &DaemonArgs) -> anyhow::Result<()> {
+    let client = DaemonClient::new();
+    if client.is_running().await {
+        let instances = request_daemon_shutdown(&client).await?;
+        println!(
+            "Restarting Starling daemon; stopping {} instance{} first...",
+            instances.len(),
+            if instances.len() == 1 { "" } else { "s" }
+        );
+        if !wait_for_daemon_stop(&client, &instances).await {
+            anyhow::bail!("shutdown was queued, but the daemon did not stop within 8s");
+        }
+    } else {
+        println!("No Starling daemon is running; starting one.");
+    }
+    client
+        .ensure_running_with(args.proxy_port, &args.tld, &args.host, args.tls, args.lan)
+        .await?;
+    println!("Starling daemon is running.");
+    Ok(())
+}
+
+async fn request_daemon_shutdown(client: &DaemonClient) -> anyhow::Result<Vec<InstanceState>> {
+    let resp = client.call(&Request::ShutdownDaemon).await?;
+    let Response::ShutdownQueued { instances } = resp else {
+        anyhow::bail!("daemon returned unexpected response: {resp:?}");
+    };
+    Ok(instances)
+}
+
+async fn wait_for_daemon_stop(client: &DaemonClient, instances: &[InstanceState]) -> bool {
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let instances_stopped = instances.iter().all(|i| !pid_is_running(i.pid));
+        if instances_stopped && !client.is_running().await {
+            return true;
+        }
+    }
+    false
 }
 
 async fn up(args: UpArgs) {
