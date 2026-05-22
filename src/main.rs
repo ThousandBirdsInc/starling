@@ -10,6 +10,7 @@ mod api;
 mod certs;
 mod daemon;
 mod engine;
+mod health;
 mod k8s;
 mod netmodes;
 mod proxy;
@@ -36,7 +37,11 @@ use crate::server::AppState;
 use crate::store::Store;
 
 #[derive(Parser)]
-#[command(name = "starling", version, about = "Starling: orchestrate your local dev services with named URLs")]
+#[command(
+    name = "starling",
+    version,
+    about = "Starling: orchestrate your local dev services with named URLs"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -321,18 +326,26 @@ async fn sync_hosts() -> anyhow::Result<()> {
 
 /// Map a `UIResource` to the compact snapshot the dashboard shows.
 fn snapshot(r: &api::v1alpha1::UIResource) -> ResourceSnapshot {
-    let name = r.metadata.as_ref().map(|m| m.name.clone()).unwrap_or_default();
+    let name = r
+        .metadata
+        .as_ref()
+        .map(|m| m.name.clone())
+        .unwrap_or_default();
     let st = r.status.clone().unwrap_or_default();
     let kind = st
         .specs
         .first()
         .and_then(|s| s.target_type.clone())
         .unwrap_or_else(|| "local".into());
-    let pod = st.k8s_resource_info.as_ref().and_then(|k| k.pod_name.clone());
-    let url = st
-        .endpoint_links
-        .first()
-        .and_then(|l| l.url.clone());
+    let pod = st
+        .k8s_resource_info
+        .as_ref()
+        .and_then(|k| k.pod_name.clone());
+    let url = st.endpoint_links.first().and_then(|l| l.url.clone());
+    let proxy_condition = st
+        .conditions
+        .iter()
+        .find(|c| c.condition_type == "ProxyReachable");
     ResourceSnapshot {
         name,
         kind,
@@ -340,6 +353,8 @@ fn snapshot(r: &api::v1alpha1::UIResource) -> ResourceSnapshot {
         runtime_status: st.runtime_status.unwrap_or_default(),
         pod,
         url,
+        proxy_status: proxy_condition.map(|c| c.status.clone()),
+        proxy_message: proxy_condition.and_then(|c| c.message.clone()),
         build_count: st.build_history.len() as u32,
         last_deploy: st.last_deploy_time,
     }
@@ -450,7 +465,16 @@ async fn status(args: StatusArgs) -> anyhow::Result<()> {
     let mut route_checks = Vec::new();
     if !args.no_check {
         for route in &state.routes {
-            route_checks.push((route.hostname.clone(), route.port, route_open(route.port).await));
+            let backend_open = route_open(route.port).await;
+            let proxy_health =
+                health::check_proxy_route(&route.hostname, state.proxy_port, "starling-status")
+                    .await;
+            route_checks.push((
+                route.hostname.clone(),
+                route.port,
+                backend_open,
+                proxy_health,
+            ));
         }
     }
 
@@ -461,13 +485,28 @@ async fn status(args: StatusArgs) -> anyhow::Result<()> {
             .map(|route| {
                 let reachable = route_checks
                     .iter()
-                    .find(|(host, _, _)| host == &route.hostname)
-                    .map(|(_, _, ok)| *ok);
+                    .find(|(host, _, _, _)| host == &route.hostname)
+                    .map(|(_, _, ok, _)| *ok);
+                let proxy_status = route_checks
+                    .iter()
+                    .find(|(host, _, _, _)| host == &route.hostname)
+                    .and_then(|(_, _, _, health)| health.status);
+                let proxy_reachable = route_checks
+                    .iter()
+                    .find(|(host, _, _, _)| host == &route.hostname)
+                    .map(|(_, _, _, health)| health.ok);
+                let proxy_message = route_checks
+                    .iter()
+                    .find(|(host, _, _, _)| host == &route.hostname)
+                    .map(|(_, _, _, health)| health.message.clone());
                 serde_json::json!({
                     "hostname": route.hostname,
                     "port": route.port,
                     "instance": route.instance,
                     "reachable": reachable,
+                    "proxy_reachable": proxy_reachable,
+                    "proxy_status": proxy_status,
+                    "proxy_message": proxy_message,
                 })
             })
             .collect();
@@ -497,16 +536,17 @@ async fn status(args: StatusArgs) -> anyhow::Result<()> {
             continue;
         }
         println!(
-            "  {:<28} {:<10} {:<12} {:<14} {}",
-            "RESOURCE", "KIND", "UPDATE", "RUNTIME", "URL"
+            "  {:<28} {:<10} {:<12} {:<14} {:<8} {}",
+            "RESOURCE", "KIND", "UPDATE", "RUNTIME", "PROXY", "URL"
         );
         for res in &inst.resources {
             println!(
-                "  {:<28} {:<10} {:<12} {:<14} {}",
+                "  {:<28} {:<10} {:<12} {:<14} {:<8} {}",
                 res.name,
                 res.kind,
                 empty_dash(&res.update_status),
                 empty_dash(&res.runtime_status),
+                proxy_condition_label(res.proxy_status.as_deref()),
                 res.url.as_deref().unwrap_or("-")
             );
         }
@@ -519,13 +559,26 @@ async fn status(args: StatusArgs) -> anyhow::Result<()> {
     for route in &state.routes {
         let reachable = route_checks
             .iter()
-            .find(|(host, _, _)| host == &route.hostname)
-            .map(|(_, _, ok)| if *ok { "open" } else { "closed" })
+            .find(|(host, _, _, _)| host == &route.hostname)
+            .map(|(_, _, ok, _)| if *ok { "open" } else { "closed" })
             .unwrap_or("not checked");
+        let proxy = route_checks
+            .iter()
+            .find(|(host, _, _, _)| host == &route.hostname)
+            .map(|(_, _, _, health)| proxy_route_label(health))
+            .unwrap_or_else(|| "not checked".to_string());
         println!(
-            "  {:<40} -> 127.0.0.1:{:<5} {:<11} instance={}",
-            route.hostname, route.port, reachable, route.instance
+            "  {:<40} -> 127.0.0.1:{:<5} backend={:<11} proxy={:<9} instance={}",
+            route.hostname, route.port, reachable, proxy, route.instance
         );
+        if let Some((_, _, _, health)) = route_checks
+            .iter()
+            .find(|(host, _, _, _)| host == &route.hostname)
+        {
+            if !health.ok {
+                println!("    proxy: {}", health.message);
+            }
+        }
     }
 
     Ok(())
@@ -615,6 +668,24 @@ async fn route_open(port: u16) -> bool {
     .unwrap_or(false)
 }
 
+fn proxy_route_label(health: &health::ProxyHealth) -> String {
+    match (health.ok, health.status) {
+        (true, Some(code)) => format!("ok({code})"),
+        (false, Some(code)) => format!("bad({code})"),
+        (false, None) => "failed".to_string(),
+        (true, None) => "ok".to_string(),
+    }
+}
+
+fn proxy_condition_label(status: Option<&str>) -> &str {
+    match status {
+        Some("True") => "ok",
+        Some("False") => "failed",
+        Some(other) => other,
+        None => "-",
+    }
+}
+
 fn tail_lines(mut lines: Vec<String>, tail: usize) -> Vec<String> {
     if lines.len() > tail {
         lines.drain(0..lines.len() - tail);
@@ -659,7 +730,11 @@ fn install_skills(args: SkillsInstallArgs) -> anyhow::Result<()> {
         }
         std::fs::create_dir_all(&skill_dir)?;
         std::fs::write(&skill_file, starling_skill_markdown())?;
-        println!("Installed {} skill at {}", skill_target_name(target), skill_file.display());
+        println!(
+            "Installed {} skill at {}",
+            skill_target_name(target),
+            skill_file.display()
+        );
     }
 
     Ok(())
@@ -667,9 +742,8 @@ fn install_skills(args: SkillsInstallArgs) -> anyhow::Result<()> {
 
 fn skill_install_dir(target: SkillTarget, scope: SkillScope) -> anyhow::Result<PathBuf> {
     let cwd = std::env::current_dir()?;
-    let home = || {
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))
-    };
+    let home =
+        || dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"));
     match (target, scope) {
         (SkillTarget::Codex, SkillScope::User) => {
             if let Ok(home) = std::env::var("CODEX_HOME") {
@@ -678,15 +752,9 @@ fn skill_install_dir(target: SkillTarget, scope: SkillScope) -> anyhow::Result<P
                 Ok(home()?.join(".codex").join("skills"))
             }
         }
-        (SkillTarget::Codex, SkillScope::Project) => {
-            Ok(cwd.join(".codex").join("skills"))
-        }
-        (SkillTarget::Claude, SkillScope::User) => {
-            Ok(home()?.join(".claude").join("skills"))
-        }
-        (SkillTarget::Claude, SkillScope::Project) => {
-            Ok(cwd.join(".claude").join("skills"))
-        }
+        (SkillTarget::Codex, SkillScope::Project) => Ok(cwd.join(".codex").join("skills")),
+        (SkillTarget::Claude, SkillScope::User) => Ok(home()?.join(".claude").join("skills")),
+        (SkillTarget::Claude, SkillScope::Project) => Ok(cwd.join(".claude").join("skills")),
         (SkillTarget::All, _) => unreachable!("expanded before install"),
     }
 }
@@ -847,7 +915,10 @@ async fn up(args: UpArgs) {
         Some(ProxyHandle::Local(cfg))
     } else {
         let client = DaemonClient::new();
-        if let Err(e) = client.ensure_running(args.proxy_port, &args.tld, args.tls).await {
+        if let Err(e) = client
+            .ensure_running(args.proxy_port, &args.tld, args.tls)
+            .await
+        {
             eprintln!("starling: {e}");
             std::process::exit(1);
         }

@@ -38,6 +38,8 @@ pub struct ResourceSnapshot {
     pub runtime_status: String,
     pub pod: Option<String>,
     pub url: Option<String>,
+    pub proxy_status: Option<String>,
+    pub proxy_message: Option<String>,
     pub build_count: u32,
     pub last_deploy: Option<String>,
 }
@@ -71,9 +73,13 @@ pub struct DashboardState {
 /// A command the dashboard wants an instance to run.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Command {
-    Trigger { resource: String },
+    Trigger {
+        resource: String,
+    },
     /// Restart a resource's serve_cmd (kill the process and start it again).
-    Restart { resource: String },
+    Restart {
+        resource: String,
+    },
     /// Stop this `starling up` instance.
     Shutdown,
 }
@@ -83,8 +89,14 @@ pub enum Request {
     /// Liveness check (used by clients to detect a running daemon).
     Ping,
     /// Register a new instance; daemon assigns and returns an id.
-    Register { name: String, dir: String, pid: u32 },
-    Deregister { instance: String },
+    Register {
+        name: String,
+        dir: String,
+        pid: u32,
+    },
+    Deregister {
+        instance: String,
+    },
     /// Push the instance's current resources + recent per-resource logs.
     Update {
         instance: String,
@@ -92,25 +104,42 @@ pub enum Request {
         logs: HashMap<String, Vec<String>>,
     },
     /// Lease a free port for a serve_cmd (avoids cross-instance conflicts).
-    AllocatePort { instance: String },
+    AllocatePort {
+        instance: String,
+    },
     RegisterRoute {
         instance: String,
         hostname: String,
         port: u16,
     },
-    RemoveRoute { hostname: String },
+    RemoveRoute {
+        hostname: String,
+    },
     /// Dashboard: fetch aggregated state.
     GetState,
     /// Dashboard: fetch the recent logs for a resource.
-    GetLogs { instance: String, resource: String },
+    GetLogs {
+        instance: String,
+        resource: String,
+    },
     /// Instance: pull (and clear) pending commands queued by the dashboard.
-    PollCommands { instance: String },
+    PollCommands {
+        instance: String,
+    },
     /// Dashboard: queue a trigger for a resource on an instance.
-    Trigger { instance: String, resource: String },
+    Trigger {
+        instance: String,
+        resource: String,
+    },
     /// Dashboard: queue a serve_cmd restart for a resource on an instance.
-    Restart { instance: String, resource: String },
+    Restart {
+        instance: String,
+        resource: String,
+    },
     /// CLI: ask every instance registered for this project directory to stop.
-    ShutdownProject { dir: String },
+    ShutdownProject {
+        dir: String,
+    },
     /// CLI: ask every instance to stop, then terminate the daemon.
     ShutdownDaemon,
 }

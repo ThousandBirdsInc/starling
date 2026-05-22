@@ -11,18 +11,18 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
 use notify::{Event, RecursiveMode, Watcher};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::api::v1alpha1::*;
-use crate::store::Store;
 use crate::starlingfile::{self, Cmd, Manifest, TargetKind};
+use crate::store::Store;
 
 pub struct Engine {
     store: Arc<Store>,
@@ -100,7 +100,8 @@ impl Engine {
             self.store.upsert_resource(initial_resource(m, i as i32));
             self.store.upsert_button(disable_button(&m.name));
             for note in &m.notes {
-                self.store.append_log(Some(&m.name), "INFO", &format!("{note}\n"));
+                self.store
+                    .append_log(Some(&m.name), "INFO", &format!("{note}\n"));
             }
         }
     }
@@ -185,7 +186,8 @@ impl Engine {
             }
         };
         for line in result.log.lines() {
-            self.store.append_log(Some(&span), "INFO", &format!("{line}\n"));
+            self.store
+                .append_log(Some(&span), "INFO", &format!("{line}\n"));
         }
 
         // Remove resources that no longer exist.
@@ -331,7 +333,11 @@ impl Engine {
             // allocate one. In daemon mode this leases centrally so multiple
             // instances never collide. Docker Compose manages its own ports, so
             // it doesn't get a proxy-allocated port/URL.
-            let proxy = if m.kind == TargetKind::Local { proxy } else { None };
+            let proxy = if m.kind == TargetKind::Local {
+                proxy
+            } else {
+                None
+            };
             let port = match (m.serve_port, &proxy) {
                 (Some(p), _) => Some(p),
                 (None, Some(handle)) => handle.allocate_port().await,
@@ -339,7 +345,9 @@ impl Engine {
             };
             if let Some(p) = port {
                 m.serve_cmd.env.push(("PORT".to_string(), p.to_string()));
-                m.serve_cmd.env.push(("HOST".to_string(), "127.0.0.1".to_string()));
+                m.serve_cmd
+                    .env
+                    .push(("HOST".to_string(), "127.0.0.1".to_string()));
             }
             if let (Some(handle), Some(p)) = (&proxy, port) {
                 let host = handle.hostname(&name);
@@ -349,7 +357,8 @@ impl Engine {
                     .env
                     .push(("PORTLESS_URL".to_string(), url.clone()));
                 store.update_status(&name, |st| {
-                    st.endpoint_links.retain(|l| l.name.as_deref() != Some(&host));
+                    st.endpoint_links
+                        .retain(|l| l.name.as_deref() != Some(&host));
                     st.endpoint_links.insert(
                         0,
                         UIResourceLink {
@@ -373,7 +382,19 @@ impl Engine {
             store.update_status(&name, |st| {
                 st.runtime_status = Some("pending".to_string());
             });
-            match spawn_streaming(&m.serve_cmd, &store, &name).await {
+            let route_monitor = match (&proxy, port) {
+                (Some(handle), Some(p)) => Some(ServeRouteMonitor::new(
+                    handle.clone(),
+                    store.clone(),
+                    name.clone(),
+                    handle.hostname(&name),
+                    handle.proxy_port(),
+                    p,
+                )),
+                _ => None,
+            };
+            match spawn_streaming_observed(&m.serve_cmd, &store, &name, route_monitor.clone()).await
+            {
                 Ok(mut child) => {
                     store.update_status(&name, |st| {
                         st.runtime_status = Some("ok".to_string());
@@ -384,7 +405,13 @@ impl Engine {
                             });
                         }
                     });
+                    let health_task = route_monitor
+                        .as_ref()
+                        .map(ServeRouteMonitor::start_health_checks);
                     let status = child.wait().await;
+                    if let Some(task) = health_task {
+                        task.abort();
+                    }
                     let ok = status.map(|s| s.success()).unwrap_or(false);
                     store.update_status(&name, |st| {
                         st.runtime_status = Some(if ok { "none" } else { "error" }.to_string());
@@ -541,8 +568,11 @@ impl Engine {
         // 1. Build images via the native Docker API (bollard), then load them
         //    into a kind cluster if that's where we're deploying.
         for db in &m.docker_builds {
-            self.store
-                .append_log(Some(name), "INFO", &format!("Building image: {}\n", db.image_ref));
+            self.store.append_log(
+                Some(name),
+                "INFO",
+                &format!("Building image: {}\n", db.image_ref),
+            );
             match build_image(db, &self.store, name).await {
                 Ok(()) => {
                     if !self.dry_run {
@@ -576,7 +606,11 @@ impl Engine {
                 "INFO",
                 &format!(
                     "kubectl apply{}\n",
-                    if self.dry_run { " (dry-run=client)" } else { "" }
+                    if self.dry_run {
+                        " (dry-run=client)"
+                    } else {
+                        ""
+                    }
                 ),
             );
             match run_with_stdin(&argv, &docs, &self.store, name).await {
@@ -746,10 +780,17 @@ impl Engine {
                 if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
                     if let Some(pod) = json["items"].as_array().and_then(|a| a.first()) {
                         let pod_name = pod["metadata"]["name"].as_str().unwrap_or("").to_string();
-                        let phase = pod["status"]["phase"].as_str().unwrap_or("Unknown").to_string();
+                        let phase = pod["status"]["phase"]
+                            .as_str()
+                            .unwrap_or("Unknown")
+                            .to_string();
                         let restarts = pod["status"]["containerStatuses"]
                             .as_array()
-                            .map(|cs| cs.iter().map(|c| c["restartCount"].as_i64().unwrap_or(0)).sum::<i64>())
+                            .map(|cs| {
+                                cs.iter()
+                                    .map(|c| c["restartCount"].as_i64().unwrap_or(0))
+                                    .sum::<i64>()
+                            })
                             .unwrap_or(0);
                         let ready = pod["status"]["containerStatuses"]
                             .as_array()
@@ -774,7 +815,8 @@ impl Engine {
                             });
                         });
                         // Start streaming logs once, for the first live pod.
-                        if streaming_pod.as_deref() != Some(pod_name.as_str()) && !pod_name.is_empty()
+                        if streaming_pod.as_deref() != Some(pod_name.as_str())
+                            && !pod_name.is_empty()
                         {
                             streaming_pod = Some(pod_name.clone());
                             stream_pod_logs(pod_name, name.clone(), store.clone());
@@ -835,7 +877,8 @@ async fn build_image(
     // custom_build: run the user's command (with EXPECTED_REF) instead of bollard.
     if let Some(command) = &db.command {
         let mut cmd = command.clone();
-        cmd.env.push(("EXPECTED_REF".to_string(), db.image_ref.clone()));
+        cmd.env
+            .push(("EXPECTED_REF".to_string(), db.image_ref.clone()));
         return match run_to_completion(&cmd, store, span).await {
             Ok(true) => Ok(()),
             Ok(false) => Err(format!("custom_build {} command failed", db.image_ref)),
@@ -962,7 +1005,7 @@ fn stream_pod_logs(pod: String, span: String, store: Arc<Store>) {
             Err(_) => return,
         };
         if let Some(out) = child.stdout.take() {
-            stream_lines(out, store, span, "INFO");
+            stream_lines(out, store, span, "INFO", None);
         }
         let _ = child.wait().await;
     });
@@ -1048,6 +1091,112 @@ fn initial_resource(m: &Manifest, order: i32) -> UIResource {
     }
 }
 
+#[derive(Clone)]
+struct ServeRouteMonitor {
+    handle: crate::proxy::ProxyHandle,
+    store: Arc<Store>,
+    name: String,
+    hostname: String,
+    proxy_port: u16,
+    current_port: Arc<Mutex<u16>>,
+    proxy_reachable: Arc<Mutex<Option<bool>>>,
+}
+
+impl ServeRouteMonitor {
+    fn new(
+        handle: crate::proxy::ProxyHandle,
+        store: Arc<Store>,
+        name: String,
+        hostname: String,
+        proxy_port: u16,
+        current_port: u16,
+    ) -> Self {
+        Self {
+            handle,
+            store,
+            name,
+            hostname,
+            proxy_port,
+            current_port: Arc::new(Mutex::new(current_port)),
+            proxy_reachable: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn observe_line(&self, line: &str) {
+        let Some(detected_port) = detect_local_listen_port(line) else {
+            return;
+        };
+        let previous_port = {
+            let mut current = self.current_port.lock().unwrap();
+            if *current == detected_port {
+                return;
+            }
+            let previous = *current;
+            *current = detected_port;
+            previous
+        };
+
+        let handle = self.handle.clone();
+        let store = self.store.clone();
+        let name = self.name.clone();
+        tokio::spawn(async move {
+            handle.register(&name, detected_port).await;
+            store.append_log(
+                Some(&name),
+                "WARN",
+                &format!(
+                    "Detected serve_cmd listening on 127.0.0.1:{detected_port}; updated named route from PORT={previous_port}. Set serve_port={detected_port} or make serve_cmd use $PORT to avoid this.\n"
+                ),
+            );
+        });
+    }
+
+    fn start_health_checks(&self) -> tokio::task::AbortHandle {
+        let monitor = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                monitor.check_proxy_health().await;
+            }
+        })
+        .abort_handle()
+    }
+
+    async fn check_proxy_health(&self) {
+        let health =
+            crate::health::check_proxy_route(&self.hostname, self.proxy_port, "starling-health")
+                .await;
+        let changed = {
+            let mut current = self.proxy_reachable.lock().unwrap();
+            let changed = *current != Some(health.ok);
+            *current = Some(health.ok);
+            changed
+        };
+
+        self.store.update_status(&self.name, |st| {
+            st.conditions
+                .retain(|c| c.condition_type != "ProxyReachable");
+            st.conditions.push(UIResourceCondition {
+                condition_type: "ProxyReachable".to_string(),
+                status: if health.ok { "True" } else { "False" }.to_string(),
+                last_transition_time: Some(Utc::now().to_rfc3339()),
+                reason: Some(health.reason.clone()),
+                message: Some(health.message.clone()),
+            });
+        });
+
+        if changed {
+            self.store.append_log(
+                Some(&self.name),
+                if health.ok { "INFO" } else { "WARN" },
+                &format!("Proxy health check: {}\n", health.message),
+            );
+        }
+    }
+}
+
 /// True for events that represent content/metadata changes worth rebuilding on.
 fn is_content_event(res: &notify::Result<Event>) -> bool {
     match res {
@@ -1067,6 +1216,16 @@ async fn spawn_streaming(
     store: &Arc<Store>,
     span: &str,
 ) -> std::io::Result<tokio::process::Child> {
+    spawn_streaming_observed(cmd, store, span, None).await
+}
+
+/// Spawn a command with stdout/stderr piped, optionally observing each line.
+async fn spawn_streaming_observed(
+    cmd: &Cmd,
+    store: &Arc<Store>,
+    span: &str,
+    observer: Option<ServeRouteMonitor>,
+) -> std::io::Result<tokio::process::Child> {
     let mut command = Command::new(&cmd.argv[0]);
     command
         .args(&cmd.argv[1..])
@@ -1082,10 +1241,16 @@ async fn spawn_streaming(
     }
     let mut child = command.spawn()?;
     if let Some(out) = child.stdout.take() {
-        stream_lines(out, store.clone(), span.to_string(), "INFO");
+        stream_lines(
+            out,
+            store.clone(),
+            span.to_string(),
+            "INFO",
+            observer.clone(),
+        );
     }
     if let Some(err) = child.stderr.take() {
-        stream_lines(err, store.clone(), span.to_string(), "INFO");
+        stream_lines(err, store.clone(), span.to_string(), "INFO", observer);
     }
     Ok(child)
 }
@@ -1097,7 +1262,6 @@ async fn run_with_stdin(
     store: &Arc<Store>,
     span: &str,
 ) -> Result<bool, String> {
-    use tokio::io::AsyncWriteExt;
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         .stdin(Stdio::piped())
@@ -1115,21 +1279,17 @@ async fn run_with_stdin(
         drop(stdin);
     }
     if let Some(out) = child.stdout.take() {
-        stream_lines(out, store.clone(), span.to_string(), "INFO");
+        stream_lines(out, store.clone(), span.to_string(), "INFO", None);
     }
     if let Some(err) = child.stderr.take() {
-        stream_lines(err, store.clone(), span.to_string(), "ERROR");
+        stream_lines(err, store.clone(), span.to_string(), "ERROR", None);
     }
     let status = child.wait().await.map_err(|e| e.to_string())?;
     Ok(status.success())
 }
 
 /// Run a command to completion, streaming output. Returns Ok(success).
-async fn run_to_completion(
-    cmd: &Cmd,
-    store: &Arc<Store>,
-    span: &str,
-) -> Result<bool, String> {
+async fn run_to_completion(cmd: &Cmd, store: &Arc<Store>, span: &str) -> Result<bool, String> {
     let mut child = spawn_streaming(cmd, store, span)
         .await
         .map_err(|e| format!("spawn {}: {e}", cmd.display()))?;
@@ -1138,14 +1298,101 @@ async fn run_to_completion(
 }
 
 /// Forward each line of an async reader into the log store under `span`.
-fn stream_lines<R>(reader: R, store: Arc<Store>, span: String, level: &'static str)
-where
+fn stream_lines<R>(
+    reader: R,
+    store: Arc<Store>,
+    span: String,
+    level: &'static str,
+    observer: Option<ServeRouteMonitor>,
+) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
         let mut lines = BufReader::new(reader).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             store.append_log(Some(&span), level, &format!("{line}\n"));
+            if let Some(observer) = &observer {
+                observer.observe_line(&line);
+            }
         }
     });
+}
+
+fn detect_local_listen_port(line: &str) -> Option<u16> {
+    let lower = line.to_ascii_lowercase();
+    for prefix in [
+        "http://127.0.0.1:",
+        "http://localhost:",
+        "https://127.0.0.1:",
+        "https://localhost:",
+    ] {
+        if let Some(port) = find_port_after(&lower, prefix) {
+            return Some(port);
+        }
+    }
+
+    let looks_like_listen_line = ["listen", "serving", "running", "ready", "local:", "started"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    if !looks_like_listen_line {
+        return None;
+    }
+
+    find_port_after(&lower, "127.0.0.1:").or_else(|| find_port_after(&lower, "localhost:"))
+}
+
+fn find_port_after(line: &str, prefix: &str) -> Option<u16> {
+    let mut search_start = 0;
+    while let Some(relative_index) = line[search_start..].find(prefix) {
+        let port_start = search_start + relative_index + prefix.len();
+        if let Some(port) = parse_port_at(line, port_start) {
+            return Some(port);
+        }
+        search_start = port_start;
+    }
+    None
+}
+
+fn parse_port_at(line: &str, start: usize) -> Option<u16> {
+    let bytes = line.as_bytes();
+    let mut end = start;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == start {
+        return None;
+    }
+    line[start..end]
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_vite_local_url() {
+        assert_eq!(
+            detect_local_listen_port("  ➜  Local:   http://127.0.0.1:8090/"),
+            Some(8090)
+        );
+    }
+
+    #[test]
+    fn detects_plain_listening_message() {
+        assert_eq!(
+            detect_local_listen_port("api listening on 127.0.0.1:8088"),
+            Some(8088)
+        );
+    }
+
+    #[test]
+    fn ignores_incidental_localhost_ports_without_listener_context() {
+        assert_eq!(
+            detect_local_listen_port("database url postgres://127.0.0.1:5432/app"),
+            None
+        );
+    }
 }
