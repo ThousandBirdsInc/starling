@@ -1,10 +1,10 @@
 # Starling
 
 A local dev orchestrator, written in Rust. Starling is a fork/port of
-[Tilt](https://tilt.dev) with [`portless`](../portless) built in, **redesigned
-for scaled, agent-first engineering** — many humans and AI agents running many
-environments in parallel. It's organized around a **central daemon** with a
-**k9s-style TUI dashboard**.
+[Tilt](https://tilt.dev) with **portless**-style named URLs built in,
+**redesigned for scaled, agent-first engineering** — many humans and AI agents
+running many environments in parallel. It's organized around a **central
+daemon** with a **k9s-style TUI dashboard**.
 
 - A single background **daemon** owns one shared named-URL proxy, allocates
   ports centrally (so multiple projects never collide), and aggregates every
@@ -74,8 +74,8 @@ not yet a drop-in replacement for all of Tilt — see the roadmap below.
 
 ## What's here
 
-- `web/` — Tilt's React frontend, copied verbatim from `../tilt/web`. Built with
-  Yarn (Berry) + Create React App into `web/build`.
+- `web/` — Tilt's React frontend, vendored unchanged. Built with Yarn (Berry) +
+  Create React App into `web/build`.
 - `src/` — the Rust server + engine:
   - `api/v1alpha1.rs` — Kubernetes-style resource types (`UISession`,
     `UIResource`, `UIButton`, `Cluster`) matching `web/src/core.d.ts`.
@@ -136,6 +136,12 @@ cargo run                             # or: starling   /   starling dash
 cargo run -- daemon --proxy-port 1360 --tld localhost
 ```
 
+**Drop-in for existing Tilt projects:** `starling up` loads `./Starlingfile` if
+present, otherwise falls back to `./Tiltfile` — so you can run it in an existing
+Tilt repo with no renaming. (`--file <path>` overrides the auto-detection.)
+Starling implements Tilt's Tiltfile builtins, so most existing Tiltfiles run
+unchanged.
+
 In the **TUI**: `j`/`k` (or ↑/↓) move, `t` triggers the selected resource, `r`
 refreshes, `q` quits. The table shows every instance's resources
 (instance · resource · type · update · runtime · pod · URL) with a live log pane
@@ -183,9 +189,9 @@ skipped in dry-run since nothing is deployed.)
 
 ## Named URLs (integrated portless)
 
-The functionality of [`../portless`](../portless) is built in: instead of
-juggling random `localhost:PORT` numbers, every serving resource gets a stable,
-named URL through an embedded reverse proxy.
+portless's functionality is built in: instead of juggling random `localhost:PORT`
+numbers, every serving resource gets a stable, named URL through an embedded
+reverse proxy.
 
 - Each `local_resource` with a `serve_cmd` is assigned a free port (passed as
   `$PORT`/`$HOST` to the child) and registered as `<name>.<tld>`. Its UI link
@@ -282,4 +288,5 @@ A working dev tool for local + Kubernetes resources.
 `cargo test` covers the k8s YAML parser (workload/image/selector extraction),
 docker-image↔build-ref matching, proxy hostname/URL formatting, and the route
 registry. Daemon, reload, named-URL proxy (HTTP+HTTPS), docker_compose, and
-native image builds are verified end-to-end against the local environment.
+native image builds are verified end-to-end against a local Docker daemon and a
+kind cluster.

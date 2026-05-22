@@ -161,21 +161,31 @@ impl Engine {
         }
     }
 
-    /// Re-execute the Starlingfile and reconcile resources with the new manifests.
+    /// Log-span label for the config file, e.g. `(Tiltfile)` / `(Starlingfile)`.
+    fn config_span(&self) -> String {
+        let name = self
+            .config_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Starlingfile");
+        format!("({name})")
+    }
+
+    /// Re-execute the config and reconcile resources with the new manifests.
     async fn reload(&mut self) {
+        let span = self.config_span();
         self.store
-            .append_log(Some("(Starlingfile)"), "INFO", "Starlingfile changed; reloading...\n");
+            .append_log(Some(&span), "INFO", "Config changed; reloading...\n");
         let result = match starlingfile::load(&self.config_path) {
             Ok(r) => r,
             Err(e) => {
                 self.store
-                    .append_log(Some("(Starlingfile)"), "ERROR", &format!("Reload failed: {e}\n"));
+                    .append_log(Some(&span), "ERROR", &format!("Reload failed: {e}\n"));
                 return;
             }
         };
         for line in result.log.lines() {
-            self.store
-                .append_log(Some("(Starlingfile)"), "INFO", &format!("{line}\n"));
+            self.store.append_log(Some(&span), "INFO", &format!("{line}\n"));
         }
 
         // Remove resources that no longer exist.
@@ -200,9 +210,9 @@ impl Engine {
         self.materialize_all();
         self.start_serves();
         self.store.append_log(
-            Some("(Starlingfile)"),
+            Some(&span),
             "INFO",
-            &format!("Starlingfile reloaded ({} resources)\n", self.manifests.len()),
+            &format!("Config reloaded ({} resources)\n", self.manifests.len()),
         );
         for name in self.initial_build_order() {
             self.run_build(&name).await;

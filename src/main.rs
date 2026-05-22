@@ -65,9 +65,10 @@ struct UpArgs {
     /// Directory of the built frontend assets (only used with --web).
     #[arg(long, default_value = "web/build")]
     web_dir: String,
-    /// Path to the Starlingfile to load.
-    #[arg(long, default_value = "Starlingfile")]
-    file: String,
+    /// Config to load. Defaults to ./Starlingfile, falling back to ./Tiltfile
+    /// (Starling runs existing Tiltfiles unchanged).
+    #[arg(long)]
+    file: Option<String>,
     /// Apply Kubernetes manifests with `--dry-run=client` (nothing mutated).
     #[arg(long, default_value_t = false)]
     dry_run: bool,
@@ -213,7 +214,30 @@ fn snapshot(r: &api::v1alpha1::UIResource) -> ResourceSnapshot {
     }
 }
 
-/// Infer a project name from the Starlingfile's directory.
+/// Resolve which config file to load: an explicit `--file`, else `./Starlingfile`,
+/// else `./Tiltfile` — so `starling up` runs an existing Tilt project unchanged.
+fn resolve_config(explicit: Option<&str>) -> PathBuf {
+    if let Some(f) = explicit {
+        return PathBuf::from(f);
+    }
+    for candidate in ["Starlingfile", "Tiltfile"] {
+        if std::path::Path::new(candidate).exists() {
+            return PathBuf::from(candidate);
+        }
+    }
+    PathBuf::from("Starlingfile")
+}
+
+/// Log-span label for the config file, e.g. `(Tiltfile)` or `(Starlingfile)`.
+fn config_span(path: &std::path::Path) -> String {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Starlingfile");
+    format!("({name})")
+}
+
+/// Infer a project name from the config file's directory.
 fn project_name(file: &PathBuf) -> String {
     let dir = std::fs::canonicalize(file)
         .ok()
@@ -227,6 +251,10 @@ fn project_name(file: &PathBuf) -> String {
 }
 
 async fn up(args: UpArgs) {
+    // Resolve the config: explicit --file, else ./Starlingfile, else ./Tiltfile.
+    let config_path = resolve_config(args.file.as_deref());
+    let span = config_span(&config_path);
+
     let (build_tx, build_rx) = mpsc::unbounded_channel::<String>();
     let (restart_tx, restart_rx) = mpsc::unbounded_channel::<String>();
     let store = Arc::new(Store::new(build_tx.clone()));
@@ -257,8 +285,8 @@ async fn up(args: UpArgs) {
             eprintln!("starling: {e}");
             std::process::exit(1);
         }
-        let name = project_name(&PathBuf::from(&args.file));
-        let dir = std::fs::canonicalize(&args.file)
+        let name = project_name(&config_path);
+        let dir = std::fs::canonicalize(&config_path)
             .ok()
             .and_then(|p| p.parent().map(|p| p.display().to_string()))
             .unwrap_or_default();
@@ -288,23 +316,26 @@ async fn up(args: UpArgs) {
         })
     };
 
-    // Load the Starlingfile and start the engine.
-    let config_path = PathBuf::from(&args.file);
+    // Load the config (Starlingfile or Tiltfile) and start the engine.
     match starlingfile::load(&config_path) {
         Ok(result) => {
             store.append_log(
-                Some("(Starlingfile)"),
+                Some(&span),
                 "INFO",
-                &format!("Loaded Starlingfile ({} resources)\n", result.manifests.len()),
+                &format!(
+                    "Loaded {} ({} resources)\n",
+                    config_path.display(),
+                    result.manifests.len()
+                ),
             );
             for line in result.log.lines() {
-                store.append_log(Some("(Starlingfile)"), "INFO", &format!("{line}\n"));
+                store.append_log(Some(&span), "INFO", &format!("{line}\n"));
             }
             if let Some(handle) = &proxy_handle {
                 for (name, port) in &result.aliases {
                     handle.register(name, *port).await;
                     store.append_log(
-                        Some("(Starlingfile)"),
+                        Some(&span),
                         "INFO",
                         &format!("alias: {} -> 127.0.0.1:{port}\n", handle.url_for(name)),
                     );
@@ -325,9 +356,9 @@ async fn up(args: UpArgs) {
         }
         Err(e) => {
             store.append_log(
-                Some("(Starlingfile)"),
+                Some(&span),
                 "ERROR",
-                &format!("Failed to load Starlingfile at {}: {e}\n", config_path.display()),
+                &format!("Failed to load {}: {e}\n", config_path.display()),
             );
         }
     }
