@@ -2728,7 +2728,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "starling"
+name = "starling-devex"
 version = "0.1.0"
 dependencies = [
  "allocative",

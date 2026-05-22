@@ -1,14 +1,15 @@
 [package]
-name = "starling"
+name = "starling-devex"
 version = "0.1.0"
 edition = "2021"
 description = "Starling: a local dev orchestrator with a central daemon, shared named-URL proxy, and a k9s-style TUI (a Rust port of Tilt + portless)"
 license = "Apache-2.0"
-repository = "https://github.com/thousandbirdsinc/starling"
+repository = "https://github.com/thousandbirdsinc/starling-devex"
 readme = "README.md"
 keywords = ["tilt", "kubernetes", "dev-environment", "tui", "proxy"]
 categories = ["command-line-utilities", "development-tools"]
 
+# The package is `starling-devex`; the installed CLI command is `starling`.
 [[bin]]
 name = "starling"
 path = "src/main.rs"

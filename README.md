@@ -123,6 +123,12 @@ not yet a drop-in replacement for all of Tilt — see the roadmap below.
 
 ## Running
 
+The crate is published as **`starling-devex`**; the installed CLI is **`starling`**:
+
+```bash
+cargo install starling-devex          # installs the `starling` command
+```
+
 ```bash
 # In each project directory (auto-starts the daemon on first run):
 cargo run -- up                       # or: starling up

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Publish the `starling` crate to crates.io.
+# Publish the `starling-devex` crate to crates.io.
 
 # Ensure we're in the crate root.
 if [[ ! -f Cargo.toml ]]; then
@@ -18,8 +18,8 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 fi
 
 # Dry run first.
-echo "==> Running dry-run for starling..."
-cargo publish -p starling --dry-run
+echo "==> Running dry-run for starling-devex..."
+cargo publish -p starling-devex --dry-run
 
 echo ""
 read -p "Dry run passed. Publish to crates.io? [y/N] " confirm
@@ -29,8 +29,8 @@ if [[ "$confirm" != [yY] ]]; then
 fi
 
 echo ""
-echo "==> Publishing starling..."
-cargo publish -p starling
+echo "==> Publishing starling-devex..."
+cargo publish -p starling-devex
 
 echo ""
-echo "Done. Published starling v$(cargo metadata --no-deps --format-version 1 | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)"
+echo "Done. Published starling-devex v$(cargo metadata --no-deps --format-version 1 | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)"
