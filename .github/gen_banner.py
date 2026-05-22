@@ -28,26 +28,41 @@ W, H = 1200, 360
 
 # ---- simulation parameters ------------------------------------------------
 N = 80                  # birds
-FRAMES = 120            # samples per blend period T
-WARMUP = 500            # let the flock settle before recording
+FRAMES = 132            # samples per blend period T
+WARMUP = 600            # let the flock settle before recording
 DT = 1.0
-MARGIN = 60
+MARGIN = 44
 XMIN, XMAX = MARGIN, W - MARGIN
-YMIN, YMAX = MARGIN - 20, H - MARGIN + 10
+YMIN, YMAX = MARGIN - 24, H - MARGIN + 14
 
-MAX_SPEED = 3.1
-MIN_SPEED = 1.7
-NEIGH = 78.0            # alignment / cohesion radius
-SEP = 20.0             # separation radius
-W_ALIGN = 0.045
-W_COH = 0.0032
-W_SEP = 0.08
-W_BOUND = 0.045
-JITTER = 0.06
+MAX_SPEED = 4.5
+MIN_SPEED = 2.4
+NEIGH = 84.0            # alignment / cohesion radius
+SEP = 22.0             # separation radius
+W_ALIGN = 0.038        # looser alignment -> more swirl, less lockstep
+W_COH = 0.0026
+W_SEP = 0.10
+W_BOUND = 0.05
+JITTER = 0.11          # livelier flicker
 
-# pull the flock loosely toward a roost so it stays framed around the wordmark
-ROOST = (W * 0.5, H * 0.46)
-W_ROOST = 0.0009
+# A moving attractor sweeps the flock across the banner on a figure-eight, and a
+# vortex term curls velocity around that point so the flock *wheels* like a real
+# murmuration instead of just drifting. Both are driven off the recording phase;
+# the seamless blend then closes whatever path this produces into a clean loop.
+ROOST_Y = H * 0.44
+ATTRACT_AX = 330.0      # horizontal sweep amplitude
+ATTRACT_AY = 58.0       # vertical figure-eight amplitude
+W_ROOST = 0.0019        # chase strength toward the moving attractor
+VORTEX_MAG = 0.85       # rotational curl around the attractor (wheeling)
+
+
+def attractor(phase):
+    # The visible loop has period T/2 (the raised-cosine blend makes the two
+    # halves identical), so the sweep must complete in T/2 to survive blending:
+    # at phase f and f+1/2 the attractor must be in the *same* place, hence the
+    # 4*pi (one full horizontal sweep per visible loop) and 8*pi (figure-eight).
+    return (W * 0.5 + ATTRACT_AX * math.sin(4 * math.pi * phase),
+            ROOST_Y + ATTRACT_AY * math.sin(8 * math.pi * phase))
 
 birds = []
 for _ in range(N):
@@ -71,7 +86,8 @@ def limit_speed(b):
         b["vy"] *= MIN_SPEED / s
 
 
-def step():
+def step(phase):
+    rx, ry = attractor(phase)
     for b in birds:
         ax = ay = 0.0
         cx = cy = 0.0
@@ -100,9 +116,15 @@ def step():
             b["vy"] += (cy / n - b["y"]) * W_COH
         b["vx"] += sx * W_SEP
         b["vy"] += sy * W_SEP
-        # roost attraction
-        b["vx"] += (ROOST[0] - b["x"]) * W_ROOST
-        b["vy"] += (ROOST[1] - b["y"]) * W_ROOST
+        # chase the moving attractor
+        adx = rx - b["x"]
+        ady = ry - b["y"]
+        b["vx"] += adx * W_ROOST
+        b["vy"] += ady * W_ROOST
+        # vortex: steady curl perpendicular to the attractor radius (CCW wheel)
+        inv_r = 1.0 / (math.hypot(adx, ady) + 1e-6)
+        b["vx"] += -ady * inv_r * VORTEX_MAG
+        b["vy"] += adx * inv_r * VORTEX_MAG
         # soft inward push near edges
         if b["x"] < XMIN:
             b["vx"] += (XMIN - b["x"]) * W_BOUND
@@ -120,15 +142,16 @@ def step():
         b["y"] += b["vy"] * DT
 
 
-for _ in range(WARMUP):
-    step()
+# warm up with the attractor already cycling so the flock is mid-wheel on frame 0
+for k in range(WARMUP):
+    step((k % FRAMES) / FRAMES)
 
 # record one period: raw[bird][frame] = (x, y)
 raw = [[] for _ in range(N)]
-for _ in range(FRAMES):
+for f in range(FRAMES):
     for i, b in enumerate(birds):
         raw[i].append((b["x"], b["y"]))
-    step()
+    step(f / FRAMES)
 
 # ---- seamless-loop blend --------------------------------------------------
 # The raised-cosine window makes f(t + T/2) == f(t), so the blended motion has
@@ -209,11 +232,14 @@ parts.append('''
   <rect width="1200" height="360" fill="url(#sky)"/>
   <rect width="1200" height="360" fill="url(#dusk)"/>
 
-  <!-- wordmark the flock wheels around -->
+  <!-- wordmark the flock wheels around: bright fill + dark stroke halo so it
+       stays high-contrast and legible even as birds pass in front of it -->
   <text class="wm" x="600" y="206" text-anchor="middle" font-size="92" font-weight="700"
-        letter-spacing="14" fill="#f4c24a" fill-opacity="0.10">STARLING</text>
-  <text class="wm" x="600" y="246" text-anchor="middle" font-size="15" font-weight="500"
-        letter-spacing="7" fill="#c9a24a" fill-opacity="0.30">A&#160;&#160;LOCAL&#160;&#160;DEV&#160;&#160;ORCHESTRATOR</text>
+        letter-spacing="14" paint-order="stroke" stroke="#000000" stroke-opacity="0.6"
+        stroke-width="6" fill="#ffe6a0" fill-opacity="0.97">STARLING</text>
+  <text class="wm" x="600" y="246" text-anchor="middle" font-size="15" font-weight="600"
+        letter-spacing="7" paint-order="stroke" stroke="#000000" stroke-opacity="0.5"
+        stroke-width="3" fill="#f3cf78" fill-opacity="0.85">A&#160;&#160;LOCAL&#160;&#160;DEV&#160;&#160;ORCHESTRATOR</text>
 ''')
 
 # birds — a tiny dart drawn pointing +x; rotate="auto" aligns it with travel
