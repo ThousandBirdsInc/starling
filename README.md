@@ -164,6 +164,10 @@ cargo run -- down --file path/to/Starlingfile
 
 # Open the shared dashboard (k9s-style TUI) from anywhere:
 cargo run                             # or: starling   /   starling dash
+cargo run -- status --json            # machine-readable daemon/resource/routes
+cargo run -- logs paas-ui --tail 80    # recent logs for one resource
+cargo run -- skills install --target all
+cargo run -- skills install --target claude --scope project
 
 # Run the daemon explicitly (optional; up/dash auto-start it):
 cargo run -- daemon --proxy-port 1360 --tld localhost

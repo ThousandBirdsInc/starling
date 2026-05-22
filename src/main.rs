@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tokio::sync::mpsc;
 
 use crate::daemon::client::DaemonClient;
@@ -48,6 +48,12 @@ enum Command {
     Up(UpArgs),
     /// Stop the running instance(s) for the current project.
     Down(DownArgs),
+    /// Print daemon, resource, and named-route status.
+    Status(StatusArgs),
+    /// Fetch recent logs for one or more resources.
+    Logs(LogsArgs),
+    /// Install agent skills for Codex and Claude Code.
+    Skills(SkillsArgs),
     /// Run the central daemon (auto-started by `up`/`dash` if not running).
     Daemon(DaemonArgs),
     /// Open the shared k9s-style TUI dashboard (default when run with no args).
@@ -106,6 +112,69 @@ struct DownArgs {
     /// to ./Tiltfile, matching `starling up`.
     #[arg(long)]
     file: Option<String>,
+}
+
+#[derive(Parser)]
+struct StatusArgs {
+    /// Emit machine-readable JSON.
+    #[arg(long, default_value_t = false)]
+    json: bool,
+    /// Skip probing route backend ports.
+    #[arg(long, default_value_t = false)]
+    no_check: bool,
+}
+
+#[derive(Parser)]
+struct LogsArgs {
+    /// Resource name to fetch. Omit to fetch logs for all resources.
+    resource: Option<String>,
+    /// Instance id or project name to narrow matches.
+    #[arg(long)]
+    instance: Option<String>,
+    /// Number of recent log lines per resource.
+    #[arg(long, default_value_t = 120)]
+    tail: usize,
+    /// Emit machine-readable JSON.
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+#[derive(Parser)]
+struct SkillsArgs {
+    #[command(subcommand)]
+    command: SkillsCommand,
+}
+
+#[derive(Subcommand)]
+enum SkillsCommand {
+    /// Install the Starling skill for Codex and/or Claude Code.
+    Install(SkillsInstallArgs),
+}
+
+#[derive(Parser)]
+struct SkillsInstallArgs {
+    /// Agent to install for.
+    #[arg(long, value_enum, default_value_t = SkillTarget::All)]
+    target: SkillTarget,
+    /// Install into user-level or project-local skill directories.
+    #[arg(long, value_enum, default_value_t = SkillScope::User)]
+    scope: SkillScope,
+    /// Replace an existing installed skill.
+    #[arg(long, default_value_t = false)]
+    force: bool,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum SkillTarget {
+    Codex,
+    Claude,
+    All,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum SkillScope {
+    User,
+    Project,
 }
 
 #[derive(Parser)]
@@ -176,6 +245,24 @@ async fn main() {
         Some(Command::Down(a)) => {
             if let Err(e) = down(a).await {
                 eprintln!("starling down: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Status(a)) => {
+            if let Err(e) = status(a).await {
+                eprintln!("starling status: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Logs(a)) => {
+            if let Err(e) = logs(a).await {
+                eprintln!("starling logs: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Skills(a)) => {
+            if let Err(e) = skills(a) {
+                eprintln!("starling skills: {e}");
                 std::process::exit(1);
             }
         }
@@ -352,6 +439,309 @@ async fn down(args: DownArgs) -> anyhow::Result<()> {
         ids.len(),
         if ids.len() == 1 { "" } else { "s" }
     )
+}
+
+async fn status(args: StatusArgs) -> anyhow::Result<()> {
+    let client = DaemonClient::new();
+    let Response::State(state) = client.call(&Request::GetState).await? else {
+        anyhow::bail!("could not query daemon state");
+    };
+
+    let mut route_checks = Vec::new();
+    if !args.no_check {
+        for route in &state.routes {
+            route_checks.push((route.hostname.clone(), route.port, route_open(route.port).await));
+        }
+    }
+
+    if args.json {
+        let route_status: Vec<_> = state
+            .routes
+            .iter()
+            .map(|route| {
+                let reachable = route_checks
+                    .iter()
+                    .find(|(host, _, _)| host == &route.hostname)
+                    .map(|(_, _, ok)| *ok);
+                serde_json::json!({
+                    "hostname": route.hostname,
+                    "port": route.port,
+                    "instance": route.instance,
+                    "reachable": reachable,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "proxy_port": state.proxy_port,
+                "tld": state.tld,
+                "instances": state.instances,
+                "routes": route_status,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("Daemon: proxy :{}  tld {}", state.proxy_port, state.tld);
+    if state.instances.is_empty() {
+        println!("No running instances.");
+    }
+    for inst in &state.instances {
+        println!(
+            "\nInstance {}  name={}  pid={}  dir={}",
+            inst.id, inst.name, inst.pid, inst.dir
+        );
+        if inst.resources.is_empty() {
+            println!("  No resources.");
+            continue;
+        }
+        println!(
+            "  {:<28} {:<10} {:<12} {:<14} {}",
+            "RESOURCE", "KIND", "UPDATE", "RUNTIME", "URL"
+        );
+        for res in &inst.resources {
+            println!(
+                "  {:<28} {:<10} {:<12} {:<14} {}",
+                res.name,
+                res.kind,
+                empty_dash(&res.update_status),
+                empty_dash(&res.runtime_status),
+                res.url.as_deref().unwrap_or("-")
+            );
+        }
+    }
+
+    println!("\nRoutes:");
+    if state.routes.is_empty() {
+        println!("  No routes.");
+    }
+    for route in &state.routes {
+        let reachable = route_checks
+            .iter()
+            .find(|(host, _, _)| host == &route.hostname)
+            .map(|(_, _, ok)| if *ok { "open" } else { "closed" })
+            .unwrap_or("not checked");
+        println!(
+            "  {:<40} -> 127.0.0.1:{:<5} {:<11} instance={}",
+            route.hostname, route.port, reachable, route.instance
+        );
+    }
+
+    Ok(())
+}
+
+async fn logs(args: LogsArgs) -> anyhow::Result<()> {
+    let client = DaemonClient::new();
+    let Response::State(state) = client.call(&Request::GetState).await? else {
+        anyhow::bail!("could not query daemon state");
+    };
+
+    let mut matches = Vec::new();
+    for inst in &state.instances {
+        if let Some(filter) = &args.instance {
+            if &inst.id != filter && &inst.name != filter {
+                continue;
+            }
+        }
+        for res in &inst.resources {
+            if let Some(filter) = &args.resource {
+                if &res.name != filter {
+                    continue;
+                }
+            }
+            matches.push((inst.id.clone(), inst.name.clone(), res.name.clone()));
+        }
+    }
+
+    if matches.is_empty() {
+        anyhow::bail!("no matching resources; run `starling status` to list resources");
+    }
+
+    let mut outputs = Vec::new();
+    for (instance_id, instance_name, resource) in matches {
+        let lines = match client
+            .call(&Request::GetLogs {
+                instance: instance_id.clone(),
+                resource: resource.clone(),
+            })
+            .await?
+        {
+            Response::Logs(lines) => tail_lines(lines, args.tail),
+            other => anyhow::bail!("daemon returned unexpected response: {other:?}"),
+        };
+        outputs.push((instance_id, instance_name, resource, lines));
+    }
+
+    if args.json {
+        let items: Vec<_> = outputs
+            .into_iter()
+            .map(|(instance_id, instance_name, resource, lines)| {
+                serde_json::json!({
+                    "instance": instance_id,
+                    "instance_name": instance_name,
+                    "resource": resource,
+                    "lines": lines,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&items)?);
+        return Ok(());
+    }
+
+    let multiple = outputs.len() > 1;
+    for (instance_id, instance_name, resource, lines) in outputs {
+        if multiple {
+            println!("== {instance_name}/{resource} ({instance_id}) ==");
+        }
+        for line in lines {
+            println!("{line}");
+        }
+        if multiple {
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+async fn route_open(port: u16) -> bool {
+    tokio::time::timeout(
+        Duration::from_millis(250),
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false)
+}
+
+fn tail_lines(mut lines: Vec<String>, tail: usize) -> Vec<String> {
+    if lines.len() > tail {
+        lines.drain(0..lines.len() - tail);
+    }
+    lines
+}
+
+fn empty_dash(s: &str) -> &str {
+    if s.is_empty() {
+        "-"
+    } else {
+        s
+    }
+}
+
+fn skills(args: SkillsArgs) -> anyhow::Result<()> {
+    match args.command {
+        SkillsCommand::Install(args) => install_skills(args),
+    }
+}
+
+fn install_skills(args: SkillsInstallArgs) -> anyhow::Result<()> {
+    let mut targets = Vec::new();
+    match args.target {
+        SkillTarget::Codex => targets.push(SkillTarget::Codex),
+        SkillTarget::Claude => targets.push(SkillTarget::Claude),
+        SkillTarget::All => {
+            targets.push(SkillTarget::Codex);
+            targets.push(SkillTarget::Claude);
+        }
+    }
+
+    for target in targets {
+        let dir = skill_install_dir(target, args.scope)?;
+        let skill_dir = dir.join("starling-devex");
+        let skill_file = skill_dir.join("SKILL.md");
+        if skill_file.exists() && !args.force {
+            anyhow::bail!(
+                "{} already exists; rerun with --force to replace it",
+                skill_file.display()
+            );
+        }
+        std::fs::create_dir_all(&skill_dir)?;
+        std::fs::write(&skill_file, starling_skill_markdown())?;
+        println!("Installed {} skill at {}", skill_target_name(target), skill_file.display());
+    }
+
+    Ok(())
+}
+
+fn skill_install_dir(target: SkillTarget, scope: SkillScope) -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    let home = || {
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))
+    };
+    match (target, scope) {
+        (SkillTarget::Codex, SkillScope::User) => {
+            if let Ok(home) = std::env::var("CODEX_HOME") {
+                Ok(PathBuf::from(home).join("skills"))
+            } else {
+                Ok(home()?.join(".codex").join("skills"))
+            }
+        }
+        (SkillTarget::Codex, SkillScope::Project) => {
+            Ok(cwd.join(".codex").join("skills"))
+        }
+        (SkillTarget::Claude, SkillScope::User) => {
+            Ok(home()?.join(".claude").join("skills"))
+        }
+        (SkillTarget::Claude, SkillScope::Project) => {
+            Ok(cwd.join(".claude").join("skills"))
+        }
+        (SkillTarget::All, _) => unreachable!("expanded before install"),
+    }
+}
+
+fn skill_target_name(target: SkillTarget) -> &'static str {
+    match target {
+        SkillTarget::Codex => "Codex",
+        SkillTarget::Claude => "Claude",
+        SkillTarget::All => "all",
+    }
+}
+
+fn starling_skill_markdown() -> &'static str {
+    r#"---
+name: starling-devex
+description: Use when operating or diagnosing Starling local dev environments, including named URL proxy issues, resource health checks, recent service logs, project shutdown, and daemon lifecycle management.
+---
+
+# Starling Dev Environment
+
+Use the `starling` CLI instead of scraping the TUI when checking local dev environment state for users or agents.
+
+## Core Commands
+
+- `starling status --json`: machine-readable daemon state, instances, resources, routes, and route backend reachability.
+- `starling status`: human-readable summary of the same state.
+- `starling logs <resource> --tail 120 --json`: recent logs for a resource.
+- `starling logs --instance <id-or-name> --json`: recent logs for all resources in one instance.
+- `starling down --file <Starlingfile-or-Tiltfile>`: stop the running project instance matching that config directory.
+- `starling daemon --shutdown`: stop all running instances and terminate the daemon.
+- `starling daemon --restart`: restart the daemon, or start it if absent.
+
+## Diagnosing 502 Named URLs
+
+If a Starling URL returns `502 Bad Gateway`, run:
+
+```bash
+starling status --json
+starling logs <resource> --tail 80
+```
+
+Interpretation:
+
+- A route with `"reachable": false` means the Starling proxy has a route, but `127.0.0.1:<port>` is not accepting connections.
+- If logs show the app listening on a different port than the route, update the Starlingfile resource to either honor `$PORT` or set `serve_port=<actual-port>`.
+- If the process is running but bound to another interface or container-only address, bind it to `127.0.0.1` or expose the selected port on the host.
+
+## Preferred Agent Workflow
+
+1. Run `starling status --json`.
+2. Identify the instance/resource and route backend port.
+3. Run `starling logs <resource> --tail 120 --json`.
+4. Recommend a concrete Starlingfile or service-command fix based on the port and logs.
+5. Use `starling down` or `starling daemon --shutdown` only when asked to stop services.
+"#
 }
 
 fn pid_is_running(pid: u32) -> bool {
