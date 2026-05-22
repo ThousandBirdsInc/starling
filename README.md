@@ -21,7 +21,7 @@
 
 <p align="center">
 <a href="https://github.com/ThousandBirdsInc/starling/commits"><img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/ThousandBirdsInc/starling" /></a>
-<a href="https://crates.io/crates/starling-devex"><img alt="crates.io version" src="https://img.shields.io/crates/v/starling-devex" /></a>
+<a href="https://crates.io/crates/starling-devex"><img alt="crates.io version" src="https://img.shields.io/crates/v/starling-devex.svg?cacheSeconds=60" /></a>
 <a href="Cargo.toml"><img alt="License Apache-2.0" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" /></a>
 </p>
 
