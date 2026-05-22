@@ -27,33 +27,38 @@ random.seed(7)
 W, H = 1200, 360
 
 # ---- simulation parameters ------------------------------------------------
-N = 80                  # birds
-FRAMES = 132            # samples per blend period T
-WARMUP = 600            # let the flock settle before recording
+N = 96                  # birds
+FRAMES = 168            # samples per blend period T
+WARMUP = 700            # let the flock settle before recording
 DT = 1.0
-MARGIN = 44
+MARGIN = 30
 XMIN, XMAX = MARGIN, W - MARGIN
-YMIN, YMAX = MARGIN - 24, H - MARGIN + 14
+YMIN, YMAX = MARGIN - 24, H - MARGIN + 16
 
-MAX_SPEED = 4.5
-MIN_SPEED = 2.4
-NEIGH = 84.0            # alignment / cohesion radius
-SEP = 22.0             # separation radius
-W_ALIGN = 0.038        # looser alignment -> more swirl, less lockstep
+# Birds move fast enough (sim units) to actually keep up with the swept
+# attractor; the long animation duration makes this read as smooth gliding, not
+# darting. Speed clamp + separation keep the blob shimmering rather than rigid.
+MAX_SPEED = 13.0
+MIN_SPEED = 6.5
+NEIGH = 120.0          # alignment / cohesion radius
+SEP = 32.0            # separation radius (bigger -> looser, airier cloud)
+W_ALIGN = 0.05
 W_COH = 0.0026
-W_SEP = 0.10
-W_BOUND = 0.05
-JITTER = 0.11          # livelier flicker
+W_SEP = 0.18
+W_BOUND = 0.06
+JITTER = 0.55          # livelier flicker (scaled with the higher speed)
 
 # A moving attractor sweeps the flock across the banner on a figure-eight, and a
 # vortex term curls velocity around that point so the flock *wheels* like a real
-# murmuration instead of just drifting. Both are driven off the recording phase;
-# the seamless blend then closes whatever path this produces into a clean loop.
-ROOST_Y = H * 0.44
-ATTRACT_AX = 330.0      # horizontal sweep amplitude
-ATTRACT_AY = 58.0       # vertical figure-eight amplitude
-W_ROOST = 0.0019        # chase strength toward the moving attractor
-VORTEX_MAG = 0.85       # rotational curl around the attractor (wheeling)
+# murmuration. The sweep completes once per *visible* loop (period T/2) so it
+# survives the raised-cosine blend instead of averaging out; a strong chase
+# keeps the flock centre tracking the attractor (also T/2-periodic) so the whole
+# murmuration translates and banks across the frame.
+ROOST_Y = H * 0.46
+ATTRACT_AX = 250.0      # horizontal sweep amplitude
+ATTRACT_AY = 78.0       # vertical figure-eight amplitude
+W_ROOST = 0.020         # chase strength toward the moving attractor
+VORTEX_MAG = 2.2        # rotational curl around the attractor (wheeling)
 
 
 def attractor(phase):
@@ -152,6 +157,14 @@ for f in range(FRAMES):
     for i, b in enumerate(birds):
         raw[i].append((b["x"], b["y"]))
     step(f / FRAMES)
+
+import os
+if os.environ.get("DEBUG"):
+    rcx = [sum(raw[i][f][0] for i in range(N)) / N for f in range(FRAMES)]
+    rcy = [sum(raw[i][f][1] for i in range(N)) / N for f in range(FRAMES)]
+    import sys
+    print(f"[dbg] raw flock-centre x[{min(rcx):.0f}..{max(rcx):.0f}] "
+          f"y[{min(rcy):.0f}..{max(rcy):.0f}]", file=sys.stderr)
 
 # ---- seamless-loop blend --------------------------------------------------
 # The raised-cosine window makes f(t + T/2) == f(t), so the blended motion has
