@@ -26,11 +26,72 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::{Frame, Terminal};
 
 use crate::daemon::client::DaemonClient;
 use crate::daemon::protocol::{DashboardState, Request, Response};
+
+/// A small, cohesive color palette (Tokyo Night-ish) used across the dashboard.
+mod theme {
+    use ratatui::style::Color;
+    pub const ACCENT: Color = Color::Rgb(122, 162, 247); // soft blue
+    pub const HEADER_BG: Color = Color::Rgb(36, 40, 59);
+    pub const SEL_BG: Color = Color::Rgb(54, 60, 96);
+    pub const MUTED: Color = Color::Rgb(132, 137, 165);
+    pub const URL: Color = Color::Rgb(125, 207, 255);
+    pub const OK: Color = Color::Rgb(158, 206, 106);
+    pub const ERR: Color = Color::Rgb(247, 118, 142);
+    pub const WARN: Color = Color::Rgb(224, 175, 104);
+    pub const INFO: Color = Color::Rgb(125, 207, 255);
+}
+
+/// Braille spinner frames used for `in_progress` status.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Symbol + color for a status value. `frame` advances the in-progress spinner.
+fn status_symbol(s: &str, frame: usize) -> (&'static str, Style) {
+    match s {
+        "ok" => ("●", Style::default().fg(theme::OK)),
+        "error" => ("●", Style::default().fg(theme::ERR)),
+        "in_progress" => (SPINNER[frame % SPINNER.len()], Style::default().fg(theme::WARN)),
+        "pending" => ("◌", Style::default().fg(theme::INFO)),
+        "not_applicable" | "none" | "" => ("·", Style::default().fg(Color::DarkGray)),
+        _ => ("•", Style::default()),
+    }
+}
+
+/// Human-friendly label for a raw status string.
+fn pretty_status(s: &str) -> String {
+    match s {
+        "not_applicable" | "none" | "" => "—".into(),
+        "in_progress" => "building".into(),
+        other => other.replace('_', " "),
+    }
+}
+
+/// A status cell: colored symbol followed by its prettified label.
+fn status_cell(s: &str, frame: usize) -> Line<'static> {
+    let (sym, style) = status_symbol(s, frame);
+    Line::from(vec![
+        Span::styled(sym, style),
+        Span::raw(" "),
+        Span::styled(pretty_status(s), style),
+    ])
+}
+
+/// Build a styled footer line from `(key, label)` pairs: keys in accent, labels muted.
+fn key_hints(pairs: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (k, label) in pairs {
+        spans.push(Span::styled(
+            (*k).to_string(),
+            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(format!(" {label}   "), Style::default().fg(theme::MUTED)));
+    }
+    Line::from(spans)
+}
 
 /// One displayed row: a resource belonging to an instance.
 #[derive(Clone)]
@@ -99,11 +160,34 @@ struct App {
     /// Port being edited in the footer.
     port_input: String,
     status_msg: String,
+    /// When `status_msg` was set; it fades from the footer after a few seconds.
+    status_at: Option<Instant>,
+    /// Reference instant for time-based animation (the in-progress spinner).
+    start: Instant,
 }
 
 impl App {
     fn selected(&self) -> Option<&RowItem> {
         self.table.selected().and_then(|i| self.rows.get(i))
+    }
+
+    /// Show a transient status message in the footer.
+    fn note(&mut self, msg: String) {
+        self.status_msg = msg;
+        self.status_at = Some(Instant::now());
+    }
+
+    /// The current status message, if it hasn't yet faded out.
+    fn active_status(&self) -> Option<&str> {
+        match self.status_at {
+            Some(t) if t.elapsed() < Duration::from_secs(4) => Some(self.status_msg.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Current spinner frame, derived from elapsed time so it animates smoothly.
+    fn spinner_frame(&self) -> usize {
+        (self.start.elapsed().as_millis() / 90) as usize
     }
 
     /// Log lines for the selected resource, filtered by `log_filter`.
@@ -145,6 +229,8 @@ async fn event_loop(
         log_scroll: 0,
         port_input: String::new(),
         status_msg: String::new(),
+        status_at: None,
+        start: Instant::now(),
     };
     let mut last_refresh = Instant::now() - Duration::from_secs(1);
 
@@ -169,7 +255,8 @@ async fn event_loop(
 
         terminal.draw(|f| draw(f, &mut app))?;
 
-        if event::poll(Duration::from_millis(250))? {
+        // Poll at ~10fps so the in-progress spinner animates while idle.
+        if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
@@ -181,18 +268,23 @@ async fn event_loop(
                 }
 
                 match app.mode {
-                    Mode::Filter => match key.code {
-                        KeyCode::Enter => app.mode = Mode::Normal,
-                        KeyCode::Esc => {
-                            app.filter.clear();
-                            app.mode = Mode::Normal;
+                    Mode::Filter => {
+                        match key.code {
+                            KeyCode::Enter => app.mode = Mode::Normal,
+                            KeyCode::Esc => {
+                                app.filter.clear();
+                                app.mode = Mode::Normal;
+                            }
+                            KeyCode::Backspace => {
+                                app.filter.pop();
+                            }
+                            KeyCode::Char(c) => app.filter.push(c),
+                            _ => {}
                         }
-                        KeyCode::Backspace => {
-                            app.filter.pop();
-                        }
-                        KeyCode::Char(c) => app.filter.push(c),
-                        _ => {}
-                    },
+                        // Re-filter and refetch logs on the next tick so the
+                        // table reacts to each keystroke instead of lagging.
+                        last_refresh = Instant::now() - Duration::from_secs(1);
+                    }
                     // Typing a log-line filter inside the full-screen log view.
                     Mode::LogsFilter => match key.code {
                         KeyCode::Enter => app.mode = Mode::Logs,
@@ -220,7 +312,7 @@ async fn event_loop(
                                             port,
                                         })
                                         .await;
-                                    app.status_msg = match resp {
+                                    let msg = match resp {
                                         Ok(Response::Ok) => {
                                             format!("changing {} to port {port}", r.name)
                                         }
@@ -230,11 +322,12 @@ async fn event_loop(
                                         Ok(other) => format!("unexpected daemon response: {other:?}"),
                                         Err(e) => format!("couldn't change port: {e}"),
                                     };
+                                    app.note(msg);
                                 }
                                 app.mode = Mode::Normal;
                             }
                             None => {
-                                app.status_msg = "port must be 1-65535".to_string();
+                                app.note("port must be 1-65535".to_string());
                             }
                         },
                         KeyCode::Esc => {
@@ -275,9 +368,11 @@ async fn event_loop(
                         KeyCode::Esc => break,
                         KeyCode::Char('j') | KeyCode::Down => {
                             move_sel(&mut app, 1);
+                            last_refresh = Instant::now() - Duration::from_secs(1);
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
                             move_sel(&mut app, -1);
+                            last_refresh = Instant::now() - Duration::from_secs(1);
                         }
                         KeyCode::Enter => {
                             app.mode = if app.mode == Mode::Detail {
@@ -307,7 +402,8 @@ async fn event_loop(
                                         resource: r.name.clone(),
                                     })
                                     .await;
-                                app.status_msg = format!("triggered {}", r.name);
+                                let name = r.name.clone();
+                                app.note(format!("triggered {name}"));
                             }
                         }
                         KeyCode::Char('R') => {
@@ -318,7 +414,8 @@ async fn event_loop(
                                         resource: r.name.clone(),
                                     })
                                     .await;
-                                app.status_msg = format!("restarting {}", r.name);
+                                let name = r.name.clone();
+                                app.note(format!("restarting {name}"));
                             }
                         }
                         KeyCode::Char('p') => {
@@ -334,12 +431,16 @@ async fn event_loop(
                             match app.selected() {
                                 Some(r) if !r.url.is_empty() => {
                                     let url = r.url.clone();
-                                    app.status_msg = match open_url(&url) {
+                                    let msg = match open_url(&url) {
                                         Ok(()) => format!("opening {url}"),
                                         Err(e) => format!("couldn't open {url}: {e}"),
                                     };
+                                    app.note(msg);
                                 }
-                                Some(r) => app.status_msg = format!("{} has no URL", r.name),
+                                Some(r) => {
+                                    let name = r.name.clone();
+                                    app.note(format!("{name} has no URL"));
+                                }
                                 None => {}
                             }
                         }
@@ -446,17 +547,6 @@ async fn fetch_logs(client: &DaemonClient, instance: &str, resource: &str) -> Ve
     }
 }
 
-fn status_style(s: &str) -> Style {
-    match s {
-        "ok" => Style::default().fg(Color::Green),
-        "error" => Style::default().fg(Color::Red),
-        "in_progress" => Style::default().fg(Color::Yellow),
-        "pending" => Style::default().fg(Color::Cyan),
-        "not_applicable" | "none" | "" => Style::default().fg(Color::DarkGray),
-        _ => Style::default(),
-    }
-}
-
 /// Render the tail of `logs` into a pane of inner height `h`, honoring scroll.
 fn log_lines(logs: &[String], h: usize, scroll: usize) -> Vec<Line<'static>> {
     if logs.is_empty() {
@@ -489,41 +579,38 @@ fn draw(f: &mut Frame, app: &mut App) {
         ])
         .split(f.area());
 
-    let title = format!(
-        " Starling  ·  {} instance(s)  ·  {} resource(s)  ·  shared proxy :{}  ·  .{} ",
-        app.state.instances.len(),
-        app.rows.len(),
-        app.state.proxy_port,
-        app.state.tld,
-    );
-    f.render_widget(
-        Paragraph::new(title).style(
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-        ),
-        chunks[0],
-    );
+    f.render_widget(title_bar(app), chunks[0]);
 
+    let frame = app.spinner_frame();
     let header = Row::new(
         ["INSTANCE", "RESOURCE", "TYPE", "UPDATE", "RUNTIME", "PORT", "POD", "URL"]
             .iter()
-            .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD))),
-    );
+            .map(|h| {
+                Cell::from(*h).style(
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                )
+            }),
+    )
+    .height(1)
+    .bottom_margin(1);
     let table_rows: Vec<Row> = app
         .rows
         .iter()
         .map(|r| {
             Row::new(vec![
-                Cell::from(r.instance_name.clone()),
-                Cell::from(r.name.clone()),
+                Cell::from(Span::styled(r.instance_name.clone(), Style::default().fg(theme::MUTED))),
+                Cell::from(Span::styled(
+                    r.name.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
                 Cell::from(r.kind.clone()),
-                Cell::from(r.update.clone()).style(status_style(&r.update)),
-                Cell::from(r.runtime.clone()).style(status_style(&r.runtime)),
+                Cell::from(status_cell(&r.update, frame)),
+                Cell::from(status_cell(&r.runtime, frame)),
                 Cell::from(r.route_port.map(|p| p.to_string()).unwrap_or_default()),
                 Cell::from(r.pod.clone()),
-                Cell::from(r.url.clone()).style(Style::default().fg(Color::Blue)),
+                Cell::from(Span::styled(r.url.clone(), Style::default().fg(theme::URL))),
             ])
         })
         .collect();
@@ -531,17 +618,28 @@ fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Length(14),
         Constraint::Length(18),
         Constraint::Length(6),
-        Constraint::Length(12),
-        Constraint::Length(14),
+        Constraint::Length(13),
+        Constraint::Length(13),
         Constraint::Length(7),
         Constraint::Length(20),
         Constraint::Min(20),
     ];
     let table = Table::new(table_rows, widths)
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title(" Resources "))
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
-        .highlight_symbol("▌ ");
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme::MUTED))
+                .title(Span::styled(
+                    " Resources ",
+                    Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .highlight_style(
+            Style::default().bg(theme::SEL_BG).add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(Span::styled("▌ ", Style::default().fg(theme::ACCENT)));
     f.render_stateful_widget(table, chunks[1], &mut app.table);
 
     let sel_name = app
@@ -549,7 +647,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         .map(|r| format!("{} / {}", r.instance_name, r.name))
         .unwrap_or_else(|| "—".into());
     let h = chunks[2].height.saturating_sub(2) as usize;
-    let follow = if app.log_scroll == 0 { "" } else { " (scrolled)" };
+    let follow = if app.log_scroll == 0 { "" } else { " · scrolled" };
     let logs = app.filtered_logs();
     let filt = if app.log_filter.is_empty() {
         String::new()
@@ -557,36 +655,96 @@ fn draw(f: &mut Frame, app: &mut App) {
         format!(" /{}", app.log_filter)
     };
     f.render_widget(
-        Paragraph::new(log_lines(&logs, h, app.log_scroll)).block(
+        Paragraph::new(log_body(&logs, h, app.log_scroll)).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Logs · {sel_name}{filt}{follow} ")),
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme::MUTED))
+                .title(Span::styled(
+                    format!(" Logs · {sel_name}{filt}{follow} "),
+                    Style::default().fg(theme::ACCENT),
+                )),
         ),
         chunks[2],
     );
 
-    let footer = if app.mode == Mode::Filter {
-        format!(" /{}\u{2588}   (Enter apply · Esc clear) ", app.filter)
+    let footer: Line = if app.mode == Mode::Filter {
+        prompt_line("filter", &app.filter, "Enter apply · Esc clear")
     } else if app.mode == Mode::PortEdit {
-        format!(
-            " port {}{}   (Enter apply · Esc cancel) ",
-            app.port_input, "\u{2588}"
-        )
+        prompt_line("port", &app.port_input, "Enter apply · Esc cancel")
     } else if app.rows.is_empty() {
-        " No resources. Run `starling up` in a project.   [/] filter  [q] quit ".to_string()
-    } else if !app.status_msg.is_empty() {
-        format!(
-            " {}   ·   [↵] detail [o] open [l] logs [t] trigger [R] restart [p] port [/] filter [q] quit ",
-            app.status_msg
-        )
+        Line::from(vec![
+            Span::styled(
+                " No resources. ",
+                Style::default().fg(theme::WARN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("Run `starling up` in a project.", Style::default().fg(theme::MUTED)),
+        ])
+    } else if let Some(msg) = app.active_status() {
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled("● ", Style::default().fg(theme::ACCENT)),
+            Span::styled(msg.to_string(), Style::default().fg(Color::White)),
+        ])
     } else {
-        " [j/k] move  [↵] detail  [l] logs  [o] open url  [t] trigger  [R] restart  [p] port  [/] filter  [q] quit "
-            .to_string()
+        key_hints(&[
+            ("j/k", "move"),
+            ("↵", "detail"),
+            ("l", "logs"),
+            ("o", "open"),
+            ("t", "trigger"),
+            ("R", "restart"),
+            ("p", "port"),
+            ("/", "filter"),
+            ("q", "quit"),
+        ])
     };
-    f.render_widget(
-        Paragraph::new(Span::styled(footer, Style::default().fg(Color::Gray))),
-        chunks[3],
-    );
+    f.render_widget(Paragraph::new(footer), chunks[3]);
+}
+
+/// The top status bar: an accent badge plus muted instance/proxy details.
+fn title_bar(app: &App) -> Paragraph<'static> {
+    let line = Line::from(vec![
+        Span::styled(
+            " ✦ Starling ",
+            Style::default()
+                .fg(Color::Rgb(20, 22, 34))
+                .bg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "  {} instances · {} resources · proxy :{} · .{} ",
+                app.state.instances.len(),
+                app.rows.len(),
+                app.state.proxy_port,
+                app.state.tld,
+            ),
+            Style::default().fg(theme::MUTED).bg(theme::HEADER_BG),
+        ),
+    ]);
+    Paragraph::new(line).style(Style::default().bg(theme::HEADER_BG))
+}
+
+/// A footer input prompt with a blinking-style cursor block.
+fn prompt_line(label: &str, value: &str, hint: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(format!("{label} "), Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{value}\u{2588}"), Style::default().fg(Color::White)),
+        Span::styled(format!("   {hint} "), Style::default().fg(theme::MUTED)),
+    ])
+}
+
+/// Log lines for a pane, or a muted placeholder when there is no output yet.
+fn log_body(logs: &[String], h: usize, scroll: usize) -> Vec<Line<'static>> {
+    if logs.is_empty() {
+        return vec![Line::from(Span::styled(
+            "  — no log output yet —",
+            Style::default().fg(theme::MUTED).add_modifier(Modifier::ITALIC),
+        ))];
+    }
+    log_lines(logs, h, scroll)
 }
 
 fn draw_detail(f: &mut Frame, app: &mut App) {
@@ -612,43 +770,78 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
         route_port: None,
     });
 
-    f.render_widget(
-        Paragraph::new(format!(" Detail · {} / {} ", r.instance_name, r.name)).style(
+    let frame = app.spinner_frame();
+    let banner = Line::from(vec![
+        Span::styled(
+            " ✦ Detail ",
             Style::default()
-                .fg(Color::White)
-                .bg(Color::Blue)
+                .fg(Color::Rgb(20, 22, 34))
+                .bg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled(
+            format!("  {} / {} ", r.instance_name, r.name),
+            Style::default().fg(theme::MUTED).bg(theme::HEADER_BG),
+        ),
+    ]);
+    f.render_widget(
+        Paragraph::new(banner).style(Style::default().bg(theme::HEADER_BG)),
         chunks[0],
     );
 
+    let field = |k: &'static str| Span::styled(k, Style::default().fg(theme::MUTED));
     let info = vec![
-        Line::from(vec![Span::styled("instance: ", bold()), Span::raw(r.instance_name.clone())]),
-        Line::from(vec![Span::styled("resource: ", bold()), Span::raw(r.name.clone())]),
-        Line::from(vec![Span::styled("type:     ", bold()), Span::raw(r.kind.clone())]),
-        Line::from(vec![Span::styled("update:   ", bold()), Span::styled(r.update.clone(), status_style(&r.update))]),
-        Line::from(vec![Span::styled("runtime:  ", bold()), Span::styled(r.runtime.clone(), status_style(&r.runtime))]),
-        Line::from(vec![Span::styled("port:     ", bold()), Span::raw(r.route_port.map(|p| p.to_string()).unwrap_or_default())]),
-        Line::from(vec![Span::styled("pod:      ", bold()), Span::raw(r.pod.clone())]),
-        Line::from(vec![Span::styled("url:      ", bold()), Span::styled(r.url.clone(), Style::default().fg(Color::Blue))]),
+        Line::from(vec![field("instance  "), Span::raw(r.instance_name.clone())]),
+        Line::from(vec![field("resource  "), Span::styled(r.name.clone(), bold())]),
+        Line::from(vec![field("type      "), Span::raw(r.kind.clone())]),
+        Line::from({
+            let mut v = vec![field("update    ")];
+            v.extend(status_cell(&r.update, frame).spans);
+            v
+        }),
+        Line::from({
+            let mut v = vec![field("runtime   ")];
+            v.extend(status_cell(&r.runtime, frame).spans);
+            v
+        }),
+        Line::from(vec![field("port      "), Span::raw(r.route_port.map(|p| p.to_string()).unwrap_or_default())]),
+        Line::from(vec![field("pod       "), Span::raw(r.pod.clone())]),
+        Line::from(vec![field("url       "), Span::styled(r.url.clone(), Style::default().fg(theme::URL).add_modifier(Modifier::UNDERLINED))]),
     ];
     f.render_widget(
-        Paragraph::new(info).block(Block::default().borders(Borders::ALL).title(" Status ")),
+        Paragraph::new(info).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme::MUTED))
+                .title(Span::styled(" Status ", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))),
+        ),
         chunks[1],
     );
 
     let h = chunks[2].height.saturating_sub(2) as usize;
     f.render_widget(
-        Paragraph::new(log_lines(&app.logs, h, app.log_scroll))
-            .block(Block::default().borders(Borders::ALL).title(" Logs ")),
+        Paragraph::new(log_body(&app.logs, h, app.log_scroll)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme::MUTED))
+                .title(Span::styled(" Logs ", Style::default().fg(theme::ACCENT))),
+        ),
         chunks[2],
     );
 
     f.render_widget(
-        Paragraph::new(Span::styled(
-            " [Esc/↵] back  [l] full logs  [o] open url  [t] trigger  [R] restart  [p] port  [PgUp/Dn] scroll  [q] quit ",
-            Style::default().fg(Color::Gray),
-        )),
+        Paragraph::new(key_hints(&[
+            ("Esc/↵", "back"),
+            ("l", "full logs"),
+            ("o", "open"),
+            ("t", "trigger"),
+            ("R", "restart"),
+            ("p", "port"),
+            ("PgUp/Dn", "scroll"),
+            ("q", "quit"),
+        ])),
         chunks[3],
     );
 }
@@ -742,38 +935,48 @@ fn draw_logs_fullscreen(f: &mut Frame, app: &mut App) {
     let matched = if app.log_filter.is_empty() {
         format!("{} lines", logs.len())
     } else {
-        format!("{} matching lines", logs.len())
+        format!("{} matching /{}", logs.len(), app.log_filter)
     };
-    f.render_widget(
-        Paragraph::new(format!(" Logs · {sel}  ·  {matched} ")).style(
+    let banner = Line::from(vec![
+        Span::styled(
+            " ✦ Logs ",
             Style::default()
-                .fg(Color::White)
-                .bg(Color::Blue)
+                .fg(Color::Rgb(20, 22, 34))
+                .bg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled(
+            format!("  {sel} · {matched} "),
+            Style::default().fg(theme::MUTED).bg(theme::HEADER_BG),
+        ),
+    ]);
+    f.render_widget(
+        Paragraph::new(banner).style(Style::default().bg(theme::HEADER_BG)),
         chunks[0],
     );
 
     let h = chunks[1].height.saturating_sub(2) as usize;
     f.render_widget(
-        Paragraph::new(log_lines(&logs, h, app.log_scroll))
-            .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(log_body(&logs, h, app.log_scroll)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme::MUTED)),
+        ),
         chunks[1],
     );
 
-    let footer = if app.mode == Mode::LogsFilter {
-        format!(" filter /{}\u{2588}   (Enter apply · Esc clear) ", app.log_filter)
-    } else if !app.log_filter.is_empty() {
-        format!(
-            " /{}   ·   [/] edit filter  [PgUp/Dn] scroll  [o] open  [l/Esc] back  [q] quit ",
-            app.log_filter
-        )
+    let footer: Line = if app.mode == Mode::LogsFilter {
+        prompt_line("filter", &app.log_filter, "Enter apply · Esc clear")
     } else {
-        " [/] filter (regex)  [PgUp/Dn j/k] scroll  [G] tail  [o] open url  [l/Esc] back  [q] quit "
-            .to_string()
+        key_hints(&[
+            ("/", "filter"),
+            ("PgUp/Dn", "scroll"),
+            ("G", "tail"),
+            ("o", "open"),
+            ("l/Esc", "back"),
+            ("q", "quit"),
+        ])
     };
-    f.render_widget(
-        Paragraph::new(Span::styled(footer, Style::default().fg(Color::Gray))),
-        chunks[2],
-    );
+    f.render_widget(Paragraph::new(footer), chunks[2]);
 }

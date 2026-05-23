@@ -1,6 +1,6 @@
 [package]
 name = "starling-devex"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 description = "Starling: a local dev orchestrator with a central daemon, shared named-URL proxy, and a k9s-style TUI (a Rust port of Tilt + portless)"
 license = "Apache-2.0"
