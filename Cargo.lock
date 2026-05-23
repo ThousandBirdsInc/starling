@@ -2729,7 +2729,7 @@ dependencies = [
 
 [[package]]
 name = "starling-devex"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "allocative",
  "anyhow",
@@ -2740,6 +2740,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "futures",
+ "libc",
  "notify",
  "ratatui",
  "rcgen",

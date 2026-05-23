@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -43,11 +44,19 @@ pub struct Engine {
     /// Resources whose `serve_cmd` is already running (avoid duplicates on reload).
     started_serves: HashSet<String>,
     /// Abort handles for running serve_cmd tasks (used to restart/kill).
-    serve_tasks: HashMap<String, tokio::task::AbortHandle>,
+    serve_tasks: HashMap<String, ServeTask>,
+    /// Incremented on config reload so stale file watcher threads stop
+    /// triggering builds for old manifests.
+    watcher_generation: Arc<AtomicU64>,
     /// Restart requests (resource names) from the dashboard.
     restart_rx: mpsc::UnboundedReceiver<String>,
     /// Named-URL proxy handle (daemon or local); `None` disables named URLs.
     proxy: Option<crate::proxy::ProxyHandle>,
+}
+
+struct ServeTask {
+    abort: tokio::task::AbortHandle,
+    pid: Arc<Mutex<Option<u32>>>,
 }
 
 impl Engine {
@@ -79,6 +88,7 @@ impl Engine {
             config_files,
             started_serves: HashSet::new(),
             serve_tasks: HashMap::new(),
+            watcher_generation: Arc::new(AtomicU64::new(0)),
             restart_rx,
             proxy,
         }
@@ -106,31 +116,22 @@ impl Engine {
         }
     }
 
-    /// Start any `serve_cmd`s not already running.
-    fn start_serves(&mut self) {
-        for m in self.manifests.clone() {
-            if !m.serve_cmd.is_empty() && self.started_serves.insert(m.name.clone()) {
-                self.spawn_serve(m);
-            }
-        }
-    }
-
     /// Run the engine until the build channel closes.
     pub async fn run(mut self) {
         self.materialize_all();
         self.start_watchers();
-        self.start_serves();
         for name in self.initial_build_order() {
             self.run_build(&name).await;
         }
 
         // Watch all config files (Starlingfile + includes + read_file paths).
         let (reload_tx, mut reload_rx) = mpsc::unbounded_channel::<()>();
-        let mut watch = self.config_files.clone();
-        if watch.is_empty() {
-            watch.push(self.config_path.clone());
-        }
-        spawn_path_watcher(watch, reload_tx);
+        let config_watch_generation = Arc::new(AtomicU64::new(0));
+        spawn_config_watcher(
+            self.config_watch_files(),
+            reload_tx.clone(),
+            config_watch_generation.clone(),
+        );
 
         // Service build requests (triggers + file changes) and reloads.
         loop {
@@ -153,6 +154,11 @@ impl Engine {
                     // Drain extra reload signals from the same save burst.
                     while reload_rx.try_recv().is_ok() {}
                     self.reload().await;
+                    spawn_config_watcher(
+                        self.config_watch_files(),
+                        reload_tx.clone(),
+                        config_watch_generation.clone(),
+                    );
                 }
                 restart = self.restart_rx.recv() => {
                     let Some(name) = restart else { continue };
@@ -170,6 +176,14 @@ impl Engine {
             .and_then(|n| n.to_str())
             .unwrap_or("Starlingfile");
         format!("({name})")
+    }
+
+    fn config_watch_files(&self) -> Vec<PathBuf> {
+        let mut watch = self.config_files.clone();
+        if watch.is_empty() {
+            watch.push(self.config_path.clone());
+        }
+        watch
     }
 
     /// Re-execute the config and reconcile resources with the new manifests.
@@ -199,18 +213,34 @@ impl Engine {
             .filter(|n| !new_names.contains(n))
             .collect();
         for name in removed {
+            self.stop_serve(&name, "Stopping serve_cmd; resource was removed...\n")
+                .await;
             self.store.remove_resource(&name);
-            self.started_serves.remove(&name);
-            if let Some(handle) = &self.proxy {
-                handle.remove(&name).await;
-            }
         }
 
         self.manifests = result.manifests;
         self.config_files = result.config_files;
         self.reindex();
+        let stopped_serves: Vec<String> = self
+            .started_serves
+            .iter()
+            .filter(|name| {
+                self.by_name
+                    .get(name.as_str())
+                    .map(|&i| self.manifests[i].serve_cmd.is_empty())
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        for name in stopped_serves {
+            self.stop_serve(
+                &name,
+                "Stopping serve_cmd; resource no longer has serve_cmd...\n",
+            )
+            .await;
+        }
         self.materialize_all();
-        self.start_serves();
+        self.start_watchers();
         self.store.append_log(
             Some(&span),
             "INFO",
@@ -257,6 +287,7 @@ impl Engine {
 
     /// Watch each resource's deps; on change, enqueue a rebuild.
     fn start_watchers(&self) {
+        let generation = self.watcher_generation.fetch_add(1, Ordering::Relaxed) + 1;
         for m in &self.manifests {
             if m.deps.is_empty() {
                 continue;
@@ -265,6 +296,7 @@ impl Engine {
             let tx = self.build_tx.clone();
             let store = self.store.clone();
             let deps = m.deps.clone();
+            let watcher_generation = self.watcher_generation.clone();
             // Manual trigger modes only mark pending changes; they don't build.
             let auto_on_change = m.auto_on_change();
             // Each watcher runs on a blocking thread; notify delivers events to
@@ -304,6 +336,9 @@ impl Engine {
                         continue;
                     }
                     while raw_rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
+                    if watcher_generation.load(Ordering::Relaxed) != generation {
+                        break;
+                    }
                     store.append_log(Some(&name), "INFO", "Detected file change\n");
                     if auto_on_change {
                         if tx.send(name.clone()).is_err() {
@@ -328,6 +363,8 @@ impl Engine {
         let store = self.store.clone();
         let name = m.name.clone();
         let proxy = self.proxy.clone();
+        let pid_slot = Arc::new(Mutex::new(None));
+        let task_pid = pid_slot.clone();
         let task = tokio::spawn(async move {
             // Decide the port: explicit serve_port, else ask the proxy handle to
             // allocate one. In daemon mode this leases centrally so multiple
@@ -396,9 +433,11 @@ impl Engine {
             match spawn_streaming_observed(&m.serve_cmd, &store, &name, route_monitor.clone()).await
             {
                 Ok(mut child) => {
+                    let pid = child.id();
+                    *task_pid.lock().unwrap() = pid;
                     store.update_status(&name, |st| {
                         st.runtime_status = Some("ok".to_string());
-                        if let Some(pid) = child.id() {
+                        if let Some(pid) = pid {
                             st.local_resource_info = Some(UIResourceLocal {
                                 pid: Some(pid as i64),
                                 is_test: Some(false),
@@ -430,21 +469,19 @@ impl Engine {
                 }
             }
         });
-        self.serve_tasks.insert(m.name.clone(), task.abort_handle());
+        self.serve_tasks.insert(
+            m.name.clone(),
+            ServeTask {
+                abort: task.abort_handle(),
+                pid: pid_slot,
+            },
+        );
     }
 
     /// Restart a resource's serve_cmd: kill the running process and start it
     /// again (gets a fresh port + route).
     async fn restart(&mut self, name: &str) {
-        if let Some(handle) = self.serve_tasks.remove(name) {
-            handle.abort(); // kill_on_drop terminates the child process
-        }
-        self.started_serves.remove(name);
-        if let Some(proxy) = &self.proxy {
-            proxy.remove(name).await;
-        }
-        self.store
-            .append_log(Some(name), "INFO", "Restarting serve_cmd...\n");
+        self.stop_serve(name, "Restarting serve_cmd...\n").await;
         // Respawn just this resource's serve.
         if let Some(&i) = self.by_name.get(name) {
             let m = self.manifests[i].clone();
@@ -455,8 +492,37 @@ impl Engine {
         }
     }
 
+    async fn stop_serve(&mut self, name: &str, message: &str) {
+        let task = self.serve_tasks.remove(name);
+        self.started_serves.remove(name);
+        if task.is_some() {
+            self.store.append_log(Some(name), "INFO", message);
+        }
+        if let Some(task) = task {
+            terminate_process_group(task.pid).await;
+            task.abort.abort();
+        }
+        if let Some(proxy) = &self.proxy {
+            proxy.remove(name).await;
+        }
+    }
+
+    async fn replace_serve_after_update(&mut self, name: &str, m: Manifest) {
+        if m.serve_cmd.is_empty() {
+            return;
+        }
+        let message = if self.started_serves.contains(name) {
+            "Restarting serve_cmd after successful update...\n"
+        } else {
+            "Starting serve_cmd after successful update...\n"
+        };
+        self.stop_serve(name, message).await;
+        self.started_serves.insert(name.to_string());
+        self.spawn_serve(m);
+    }
+
     /// Run a resource's update command as a one-shot build.
-    async fn run_build(&self, name: &str) {
+    async fn run_build(&mut self, name: &str) {
         let Some(&i) = self.by_name.get(name) else {
             return;
         };
@@ -477,13 +543,16 @@ impl Engine {
                 st.queued = Some(false);
                 st.pending_build_since = None;
                 st.update_status = Some("ok".to_string());
-                if st.runtime_status.is_none() {
+                if m.serve_cmd.is_empty() && st.runtime_status.is_none() {
                     st.runtime_status = Some(match m.kind {
                         TargetKind::Local => "not_applicable".to_string(),
                         _ => "pending".to_string(),
                     });
                 }
             });
+            if !m.serve_cmd.is_empty() {
+                self.replace_serve_after_update(name, m).await;
+            }
             return;
         }
 
@@ -536,6 +605,9 @@ impl Engine {
             );
             st.build_history.truncate(10);
         });
+        if ok && !m.serve_cmd.is_empty() {
+            self.replace_serve_after_update(name, m).await;
+        }
     }
 
     /// Build a Kubernetes resource: build referenced images with `docker build`,
@@ -944,7 +1016,12 @@ async fn build_image(
 /// paths). Fires a reload signal when any of them changes. Watches each file's
 /// parent directory (so atomic saves are caught) and matches events by
 /// canonical path.
-fn spawn_path_watcher(files: Vec<std::path::PathBuf>, tx: mpsc::UnboundedSender<()>) {
+fn spawn_config_watcher(
+    files: Vec<std::path::PathBuf>,
+    tx: mpsc::UnboundedSender<()>,
+    generation: Arc<AtomicU64>,
+) {
+    let current_generation = generation.fetch_add(1, Ordering::Relaxed) + 1;
     std::thread::spawn(move || {
         let (raw_tx, raw_rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
         let mut watcher = match notify::recommended_watcher(move |res| {
@@ -985,6 +1062,9 @@ fn spawn_path_watcher(files: Vec<std::path::PathBuf>, tx: mpsc::UnboundedSender<
                 continue;
             }
             while raw_rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
+            if generation.load(Ordering::Relaxed) != current_generation {
+                break;
+            }
             if tx.send(()).is_err() {
                 break;
             }
@@ -1231,8 +1311,10 @@ async fn spawn_streaming_observed(
         .args(&cmd.argv[1..])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // So aborting a serve task (restart/reload) kills the child process.
+        // Dropping the child still kills the direct process; serve restarts also
+        // signal the process group so shell/npm grandchildren don't survive.
         .kill_on_drop(true);
+    configure_process_group(&mut command);
     if let Some(dir) = &cmd.workdir {
         command.current_dir(dir);
     }
@@ -1254,6 +1336,47 @@ async fn spawn_streaming_observed(
     }
     Ok(child)
 }
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+async fn terminate_process_group(pid: Arc<Mutex<Option<u32>>>) {
+    let mut child_pid = None;
+    for _ in 0..10 {
+        child_pid = *pid.lock().unwrap();
+        if child_pid.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let Some(child_pid) = child_pid else {
+        return;
+    };
+    terminate_process_group_by_pid(child_pid).await;
+}
+
+#[cfg(unix)]
+async fn terminate_process_group_by_pid(pid: u32) {
+    let pgid = -(pid as i32);
+    unsafe {
+        libc::kill(pgid, libc::SIGTERM);
+    }
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let still_running = unsafe { libc::kill(pgid, 0) == 0 };
+    if still_running {
+        unsafe {
+            libc::kill(pgid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminate_process_group_by_pid(_pid: u32) {}
 
 /// Run a command, feeding `stdin_data` to its stdin, streaming output.
 async fn run_with_stdin(
