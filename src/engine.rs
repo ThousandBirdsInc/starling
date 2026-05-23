@@ -1374,6 +1374,7 @@ async fn spawn_streaming_observed(
     let mut command = Command::new(&cmd.argv[0]);
     command
         .args(&cmd.argv[1..])
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Dropping the child still kills the direct process; serve restarts also
