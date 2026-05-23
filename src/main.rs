@@ -360,6 +360,30 @@ fn snapshot(r: &api::v1alpha1::UIResource) -> ResourceSnapshot {
     }
 }
 
+fn config_error_resource(name: &str, message: &str) -> api::v1alpha1::UIResource {
+    use api::v1alpha1::*;
+    UIResource {
+        metadata: Some(ObjectMeta {
+            name: name.to_string(),
+            uid: uuid::Uuid::new_v4().to_string(),
+            ..Default::default()
+        }),
+        spec: Some(UIResourceSpec {}),
+        status: Some(UIResourceStatus {
+            runtime_status: Some("not_applicable".to_string()),
+            update_status: Some("error".to_string()),
+            conditions: vec![UIResourceCondition {
+                condition_type: "ConfigLoaded".to_string(),
+                status: "False".to_string(),
+                last_transition_time: Some(chrono::Utc::now().to_rfc3339()),
+                reason: Some("ConfigLoadFailed".to_string()),
+                message: Some(message.to_string()),
+            }],
+            ..Default::default()
+        }),
+    }
+}
+
 /// Resolve which config file to load: an explicit `--file`, else `./Starlingfile`,
 /// else `./Tiltfile` — so `starling up` runs an existing Tilt project unchanged.
 fn resolve_config(explicit: Option<&str>) -> PathBuf {
@@ -989,11 +1013,13 @@ async fn up(args: UpArgs) {
             tokio::spawn(eng.run());
         }
         Err(e) => {
+            let msg = format!("Failed to load {}: {e}", config_path.display());
             store.append_log(
                 Some(&span),
                 "ERROR",
-                &format!("Failed to load {}: {e}\n", config_path.display()),
+                &format!("{msg}\n"),
             );
+            store.upsert_resource(config_error_resource(&span, &msg));
         }
     }
 

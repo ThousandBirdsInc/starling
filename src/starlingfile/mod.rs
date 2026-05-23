@@ -67,6 +67,10 @@ fn parse_live_update(v: Value, dir: &Path) -> Vec<LiveUpdateStep> {
 
 use crate::k8s::{self, K8sEntity};
 
+const COMPAT_PRELUDE: &str = r#"
+os = struct(environ = struct(get = _starling_getenv))
+"#;
+
 /// The result of loading a Starlingfile.
 pub struct LoadResult {
     pub manifests: Vec<Manifest>,
@@ -95,6 +99,7 @@ fn parent_or_dot(path: &Path) -> PathBuf {
 fn build_globals() -> Globals {
     GlobalsBuilder::extended_by(&[
         LibraryExtension::Print,
+        LibraryExtension::StructType,
         LibraryExtension::Json,
         LibraryExtension::Map,
         LibraryExtension::Filter,
@@ -130,6 +135,7 @@ impl FileLoader for StarlingLoader<'_> {
         self.st.config_files.borrow_mut().push(target.clone());
         let src = std::fs::read_to_string(&target)
             .with_context(|| format!("load: reading {}", target.display()))?;
+        let src = with_compat_prelude(src);
         let ast = AstModule::parse(&target.to_string_lossy(), src, &Dialect::Extended)
             .map_err(|e| anyhow!("parsing {}: {e}", target.display()))?;
         let module = Module::new();
@@ -209,6 +215,10 @@ fn state<'a>(eval: &'a Evaluator) -> &'a TfState {
         .expect("Starlingfile evaluator missing TfState")
         .downcast_ref::<TfState>()
         .expect("Starlingfile evaluator extra is not TfState")
+}
+
+fn with_compat_prelude(src: String) -> String {
+    format!("{COMPAT_PRELUDE}\n{src}")
 }
 
 /// Convert a Starlark value into a list of strings (string → single element).
@@ -300,6 +310,47 @@ fn starling_builtins(builder: &mut GlobalsBuilder) {
     // Trigger-mode constants (match Tilt's Starlark-facing values).
     const TRIGGER_MODE_AUTO: i32 = TRIGGER_MODE_AUTO_VAL;
     const TRIGGER_MODE_MANUAL: i32 = TRIGGER_MODE_MANUAL_VAL;
+
+    /// Compatibility shim for `os.environ.get(...)` in Tiltfiles.
+    fn _starling_getenv<'v>(
+        name: String,
+        #[starlark(default = NoneType)] default: Value<'v>,
+        eval: &mut Evaluator<'v, '_>,
+    ) -> anyhow::Result<Value<'v>> {
+        match std::env::var(name) {
+            Ok(value) => Ok(eval.heap().alloc(value)),
+            Err(_) if default.is_none() => Ok(Value::new_none()),
+            Err(_) => Ok(default),
+        }
+    }
+
+    /// Compatibility shim for Tilt readiness probes. Starling accepts but does
+    /// not yet execute readiness probes for local resources.
+    fn probe<'v>(
+        #[starlark(require = named, default = NoneType)] period_secs: Value<'v>,
+        #[starlark(require = named, default = NoneType)] timeout_secs: Value<'v>,
+        #[starlark(require = named, default = NoneType)] initial_delay_secs: Value<'v>,
+        #[starlark(require = named, default = NoneType)] tcp_socket: Value<'v>,
+        #[starlark(require = named, default = NoneType)] http_get: Value<'v>,
+    ) -> anyhow::Result<NoneType> {
+        let _ = (
+            period_secs,
+            timeout_secs,
+            initial_delay_secs,
+            tcp_socket,
+            http_get,
+        );
+        Ok(NoneType)
+    }
+
+    /// Compatibility shim for `probe(tcp_socket=tcp_socket_action(...))`.
+    fn tcp_socket_action<'v>(
+        port: Value<'v>,
+        #[starlark(require = named, default = NoneType)] host: Value<'v>,
+    ) -> anyhow::Result<NoneType> {
+        let _ = (port, host);
+        Ok(NoneType)
+    }
 
     /// Define a resource backed by local commands. Argument order matches Tilt:
     /// `local_resource(name, cmd, deps, serve_cmd, ...)`.
@@ -900,6 +951,7 @@ fn run_starlingfile_into(path: &str, eval: &mut Evaluator) -> Result<()> {
     st.config_files.borrow_mut().push(target.clone());
     let src = std::fs::read_to_string(&target)
         .with_context(|| format!("include: reading {}", target.display()))?;
+    let src = with_compat_prelude(src);
     let ast = AstModule::parse(&target.to_string_lossy(), src, &Dialect::Extended)
         .map_err(|e| anyhow!("parsing {}: {e}", target.display()))?;
     let globals = build_globals();
@@ -1030,7 +1082,8 @@ fn assemble_k8s(st: &TfState) -> Vec<Manifest> {
 
 #[cfg(test)]
 mod tests {
-    use super::{image_matches, image_repo};
+    use super::{image_matches, image_repo, load};
+    use std::fs;
 
     #[test]
     fn matches_images_to_build_refs() {
@@ -1041,6 +1094,34 @@ mod tests {
         // Registry host:port must not be mistaken for a tag.
         assert_eq!(image_repo("localhost:5000/web"), "localhost:5000/web");
         assert_eq!(image_repo("web:tag"), "web");
+    }
+
+    #[test]
+    fn tilt_compat_os_environ_and_readiness_probe() {
+        let dir = std::env::temp_dir().join(format!(
+            "starling-tilt-compat-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Tiltfile");
+        fs::write(
+            &file,
+            r#"
+port = int(os.environ.get("STARLING_TEST_PORT", "4321"))
+local_resource(
+    "web",
+    serve_cmd="echo serving",
+    readiness_probe=probe(period_secs=2, tcp_socket=tcp_socket_action(port)),
+)
+"#,
+        )
+        .unwrap();
+
+        let result = load(&file).unwrap();
+        assert_eq!(result.manifests.len(), 1);
+        assert_eq!(result.manifests[0].name, "web");
+
+        let _ = fs::remove_dir_all(dir);
     }
 }
 
@@ -1054,6 +1135,7 @@ pub fn load(path: &Path) -> Result<LoadResult> {
         _ => PathBuf::from("."),
     };
 
+    let src = with_compat_prelude(src);
     let ast = AstModule::parse(&path.to_string_lossy(), src, &Dialect::Extended)
         .map_err(|e| anyhow!("parsing Starlingfile: {e}"))?;
 
