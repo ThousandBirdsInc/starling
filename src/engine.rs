@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use notify::{Event, RecursiveMode, Watcher};
+use regex::Regex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -412,6 +413,13 @@ impl Engine {
                 m.serve_cmd
                     .env
                     .push(("HOST".to_string(), "127.0.0.1".to_string()));
+                if rewrite_serve_cmd_port_args(&mut m.serve_cmd, p) {
+                    store.append_log(
+                        Some(&name),
+                        "INFO",
+                        &format!("Rewrote serve_cmd port flag to use allocated PORT={p}\n"),
+                    );
+                }
             }
             if let Some(reservation) = &reservation {
                 if reservation.conflict {
@@ -535,8 +543,11 @@ impl Engine {
 
     async fn change_port(&mut self, name: &str, port: u16) {
         let Some(&i) = self.by_name.get(name) else {
-            self.store
-                .append_log(Some(name), "ERROR", "Cannot change port: resource not found\n");
+            self.store.append_log(
+                Some(name),
+                "ERROR",
+                "Cannot change port: resource not found\n",
+            );
             return;
         };
         if self.manifests[i].serve_cmd.is_empty() {
@@ -1507,6 +1518,89 @@ fn stream_lines<R>(
     });
 }
 
+const SERVE_PORT_FLAGS: &[&str] = &[
+    "--port",
+    "-p",
+    "--listen-port",
+    "--http-port",
+    "--server-port",
+    "--serve-port",
+    "--web-port",
+];
+
+fn rewrite_serve_cmd_port_args(cmd: &mut Cmd, port: u16) -> bool {
+    if let Some(command_index) = shell_command_index(&cmd.argv) {
+        if let Some(rewritten) = rewrite_shell_port_args(&cmd.argv[command_index], port) {
+            cmd.argv[command_index] = rewritten;
+            return true;
+        }
+        return false;
+    }
+
+    rewrite_argv_port_args(&mut cmd.argv, port)
+}
+
+fn shell_command_index(argv: &[String]) -> Option<usize> {
+    let shell = argv.first()?.rsplit('/').next().unwrap_or_default();
+    let flag = argv.get(1)?.as_str();
+    if matches!(shell, "sh" | "bash" | "zsh") && matches!(flag, "-c" | "-lc") && argv.len() > 2 {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+fn rewrite_argv_port_args(argv: &mut [String], port: u16) -> bool {
+    let mut changed = false;
+    let port = port.to_string();
+    let mut i = 0;
+    while i < argv.len() {
+        if let Some((flag, value)) = argv[i].split_once('=') {
+            if is_serve_port_flag(flag) && is_numeric_port(value) {
+                argv[i] = format!("{flag}={port}");
+                changed = true;
+            }
+        } else if is_serve_port_flag(&argv[i])
+            && argv.get(i + 1).is_some_and(|arg| is_numeric_port(arg))
+        {
+            argv[i + 1] = port.clone();
+            changed = true;
+            i += 1;
+        }
+        i += 1;
+    }
+    changed
+}
+
+fn rewrite_shell_port_args(command: &str, port: u16) -> Option<String> {
+    let port = port.to_string();
+    let flags = r"--(?:port|listen-port|http-port|server-port|serve-port|web-port)|-p";
+    let equals = Regex::new(&format!(
+        r"(?P<flag>(?:{flags})=)(?P<port>[1-9][0-9]{{1,4}})(?P<end>\b)"
+    ))
+    .expect("serve port equals regex compiles");
+    let after_equals = equals.replace_all(command, |caps: &regex::Captures<'_>| {
+        format!("{}{}{}", &caps["flag"], port, &caps["end"])
+    });
+    let separated = Regex::new(&format!(
+        r"(?P<flag>(?:{flags}))(?P<sep>\s+)(?P<port>[1-9][0-9]{{1,4}})(?P<end>\s|$)"
+    ))
+    .expect("serve port separated regex compiles");
+    let rewritten = separated.replace_all(&after_equals, |caps: &regex::Captures<'_>| {
+        format!("{}{}{}{}", &caps["flag"], &caps["sep"], port, &caps["end"])
+    });
+    let rewritten = rewritten.into_owned();
+    (rewritten != command).then_some(rewritten)
+}
+
+fn is_serve_port_flag(flag: &str) -> bool {
+    SERVE_PORT_FLAGS.contains(&flag)
+}
+
+fn is_numeric_port(value: &str) -> bool {
+    value.parse::<u16>().is_ok_and(|port| port != 0)
+}
+
 fn detect_local_listen_port(line: &str) -> Option<u16> {
     let lower = line.to_ascii_lowercase();
     for prefix in [
@@ -1583,5 +1677,72 @@ mod tests {
             detect_local_listen_port("database url postgres://127.0.0.1:5432/app"),
             None
         );
+    }
+
+    #[test]
+    fn rewrites_shell_serve_port_flag() {
+        let mut cmd = Cmd {
+            argv: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "cd ui && npm run dev -- --host 127.0.0.1 --port 8090 --strictPort".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        assert!(rewrite_serve_cmd_port_args(&mut cmd, 54756));
+        assert_eq!(
+            cmd.argv[2],
+            "cd ui && npm run dev -- --host 127.0.0.1 --port 54756 --strictPort"
+        );
+    }
+
+    #[test]
+    fn rewrites_shell_serve_port_equals_flag() {
+        let mut cmd = Cmd {
+            argv: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "vite --host 127.0.0.1 --port=8090".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        assert!(rewrite_serve_cmd_port_args(&mut cmd, 54756));
+        assert_eq!(cmd.argv[2], "vite --host 127.0.0.1 --port=54756");
+    }
+
+    #[test]
+    fn rewrites_argv_serve_port_flag() {
+        let mut cmd = Cmd {
+            argv: vec![
+                "npm".to_string(),
+                "run".to_string(),
+                "dev".to_string(),
+                "--".to_string(),
+                "--port".to_string(),
+                "8090".to_string(),
+                "--strictPort".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        assert!(rewrite_serve_cmd_port_args(&mut cmd, 54756));
+        assert_eq!(cmd.argv[5], "54756");
+    }
+
+    #[test]
+    fn does_not_rewrite_dynamic_port_args() {
+        let mut cmd = Cmd {
+            argv: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "vite --host 127.0.0.1 --port $PORT".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        assert!(!rewrite_serve_cmd_port_args(&mut cmd, 54756));
+        assert_eq!(cmd.argv[2], "vite --host 127.0.0.1 --port $PORT");
     }
 }
