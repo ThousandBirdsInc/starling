@@ -196,6 +196,68 @@ impl App {
     }
 }
 
+/// Make a line of externally-sourced text safe to put into ratatui's cell
+/// buffer.
+///
+/// Process logs routinely carry ANSI/VT escape sequences (colors, cursor
+/// moves) and other control bytes. ratatui copies a string's bytes verbatim
+/// into its grid and has no notion of escape sequences, so an unescaped `\x1b`
+/// is written straight to the terminal — bleeding colors and jumping the
+/// cursor across the whole UI. This strips those sequences and control
+/// characters while preserving every printable character, **including emoji**,
+/// so text still renders (just without the corruption).
+fn sanitize(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // ESC introduces an escape sequence; consume and drop it.
+            '\u{1b}' => match chars.peek() {
+                // CSI: ESC [ <params/intermediates> <final 0x40..=0x7e>
+                Some('[') => {
+                    chars.next();
+                    while let Some(&n) = chars.peek() {
+                        chars.next();
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ] ... terminated by BEL or ST (ESC \).
+                Some(']') => {
+                    chars.next();
+                    while let Some(&n) = chars.peek() {
+                        if n == '\u{7}' {
+                            chars.next();
+                            break;
+                        }
+                        if n == '\u{1b}' {
+                            chars.next();
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                        chars.next();
+                    }
+                }
+                // Any other two-character escape (ESC X): drop both.
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            '\t' => out.push_str("    "),
+            // Drop carriage returns and every other control char (C0/C1, DEL,
+            // and any stray newline within a line). Emoji and printable text
+            // are left untouched.
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Filter log lines by `pattern` (a regex; falls back to case-insensitive
 /// substring if the regex doesn't compile). Empty pattern = all lines.
 fn filter_log_lines(logs: &[String], pattern: &str) -> Vec<String> {
@@ -542,7 +604,9 @@ async fn fetch_logs(client: &DaemonClient, instance: &str, resource: &str) -> Ve
         })
         .await
     {
-        Ok(Response::Logs(l)) => l,
+        // Sanitize on the way in so escape sequences and control bytes from
+        // the underlying process can never reach ratatui's buffer.
+        Ok(Response::Logs(l)) => l.iter().map(|line| sanitize(line)).collect(),
         _ => vec![],
     }
 }
@@ -852,8 +916,24 @@ fn bold() -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_log_lines, hostname_from_url, parse_port, route_port_for_url};
+    use super::{filter_log_lines, hostname_from_url, parse_port, route_port_for_url, sanitize};
     use crate::daemon::protocol::{DashboardState, RouteInfo};
+
+    #[test]
+    fn sanitize_strips_escapes_and_control_but_keeps_emoji() {
+        // ANSI SGR color codes are removed, visible text kept.
+        assert_eq!(sanitize("\u{1b}[32mready\u{1b}[0m"), "ready");
+        // Cursor-move CSI sequences are removed.
+        assert_eq!(sanitize("a\u{1b}[2Kb"), "ab");
+        // OSC sequences (e.g. window title) terminated by BEL are removed.
+        assert_eq!(sanitize("\u{1b}]0;title\u{7}done"), "done");
+        // Carriage returns and other control bytes are dropped; tabs expand.
+        assert_eq!(sanitize("a\rb\tc\u{0}"), "ab    c");
+        // Emoji and other printable Unicode survive intact.
+        assert_eq!(sanitize("\u{1b}[33m\u{2728} built \u{1f680}"), "\u{2728} built \u{1f680}");
+        // A lone trailing ESC doesn't panic and is dropped.
+        assert_eq!(sanitize("hi\u{1b}"), "hi");
+    }
 
     #[test]
     fn log_filter_regex_substring_and_empty() {
