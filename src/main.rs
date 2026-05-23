@@ -184,6 +184,8 @@ enum SkillScope {
 
 #[derive(Parser)]
 struct DaemonArgs {
+    #[command(subcommand)]
+    service: Option<DaemonServiceCommand>,
     /// Stop all running instances and terminate the daemon.
     #[arg(long, default_value_t = false)]
     shutdown: bool,
@@ -205,6 +207,20 @@ struct DaemonArgs {
     /// (experimental; requires dns-sd/avahi).
     #[arg(long, default_value_t = false)]
     lan: bool,
+}
+
+#[derive(Subcommand)]
+enum DaemonServiceCommand {
+    /// macOS only: install and start a user LaunchAgent for the daemon.
+    InstallService,
+    /// macOS only: stop and remove the user LaunchAgent for the daemon.
+    UninstallService,
+    /// macOS only: start the installed user LaunchAgent for the daemon.
+    StartService,
+    /// macOS only: stop the installed user LaunchAgent for the daemon.
+    StopService,
+    /// macOS only: print user LaunchAgent status for the daemon.
+    ServiceStatus,
 }
 
 #[derive(Parser)]
@@ -229,7 +245,18 @@ async fn main() {
 
     match Cli::parse().command {
         Some(Command::Daemon(a)) => {
-            if a.shutdown && (a.restart || a.reload) {
+            if let Some(service) = &a.service {
+                if a.shutdown || a.restart || a.reload {
+                    eprintln!(
+                        "starling daemon: service commands cannot be combined with --shutdown/--restart/--reload"
+                    );
+                    std::process::exit(2);
+                }
+                if let Err(e) = daemon_service(service, &a).await {
+                    eprintln!("starling daemon: {e}");
+                    std::process::exit(1);
+                }
+            } else if a.shutdown && (a.restart || a.reload) {
                 eprintln!("starling daemon: --shutdown cannot be combined with --restart/--reload");
                 std::process::exit(2);
             } else if a.shutdown {
@@ -881,11 +908,284 @@ async fn restart_daemon(args: &DaemonArgs) -> anyhow::Result<()> {
     } else {
         println!("No Starling daemon is running; starting one.");
     }
+    if daemon_service_installed() {
+        println!("Starting installed Starling daemon service.");
+        start_daemon_service().await?;
+        return Ok(());
+    }
     client
         .ensure_running_with(args.proxy_port, &args.tld, &args.host, args.tls, args.lan)
         .await?;
     println!("Starling daemon is running.");
     Ok(())
+}
+
+async fn daemon_service(command: &DaemonServiceCommand, args: &DaemonArgs) -> anyhow::Result<()> {
+    match command {
+        DaemonServiceCommand::InstallService => install_daemon_service(args).await,
+        DaemonServiceCommand::UninstallService => uninstall_daemon_service().await,
+        DaemonServiceCommand::StartService => start_daemon_service().await,
+        DaemonServiceCommand::StopService => stop_daemon_service().await,
+        DaemonServiceCommand::ServiceStatus => daemon_service_status().await,
+    }
+}
+
+#[cfg(target_os = "macos")]
+const DAEMON_SERVICE_LABEL: &str = "com.thousandbirds.starling.daemon";
+
+#[cfg(target_os = "macos")]
+fn launch_agent_path() -> anyhow::Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("could not resolve home directory"))?
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{DAEMON_SERVICE_LABEL}.plist")))
+}
+
+#[cfg(target_os = "macos")]
+fn daemon_service_installed() -> bool {
+    launch_agent_path().map(|path| path.exists()).unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn daemon_service_installed() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_domain() -> String {
+    format!("gui/{}", unsafe { libc::getuid() })
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_target() -> String {
+    format!("{}/{}", launchd_domain(), DAEMON_SERVICE_LABEL)
+}
+
+#[cfg(target_os = "macos")]
+fn run_launchctl(args: &[&str]) -> anyhow::Result<std::process::Output> {
+    std::process::Command::new("launchctl")
+        .args(args)
+        .output()
+        .map_err(|e| anyhow::anyhow!("running launchctl {}: {e}", args.join(" ")))
+}
+
+#[cfg(target_os = "macos")]
+fn service_loaded() -> bool {
+    run_launchctl(&["print", &launchd_target()])
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(target_os = "macos")]
+fn daemon_service_plist(args: &DaemonArgs) -> anyhow::Result<String> {
+    let exe = std::env::current_exe()?;
+    let log = daemon::protocol::log_path();
+    let mut program_args = vec![
+        exe.display().to_string(),
+        "daemon".to_string(),
+        "--proxy-port".to_string(),
+        args.proxy_port.to_string(),
+        "--tld".to_string(),
+        args.tld.clone(),
+        "--host".to_string(),
+        args.host.clone(),
+    ];
+    if args.tls {
+        program_args.push("--tls".to_string());
+    }
+    if args.lan {
+        program_args.push("--lan".to_string());
+    }
+    let program_args = program_args
+        .iter()
+        .map(|arg| format!("        <string>{}</string>", xml_escape(arg)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let log = xml_escape(&log.display().to_string());
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{}</string>
+    <key>ProgramArguments</key>
+    <array>
+{}
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{}</string>
+    <key>StandardErrorPath</key>
+    <string>{}</string>
+</dict>
+</plist>
+"#,
+        DAEMON_SERVICE_LABEL, program_args, log, log
+    ))
+}
+
+#[cfg(target_os = "macos")]
+async fn install_daemon_service(args: &DaemonArgs) -> anyhow::Result<()> {
+    let path = launch_agent_path()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    if let Some(dir) = daemon::protocol::log_path().parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+
+    if DaemonClient::new().is_running().await {
+        let _ = shutdown_daemon().await;
+    }
+    if service_loaded() {
+        let _ = run_launchctl(&["bootout", &launchd_target()]);
+    }
+
+    std::fs::write(&path, daemon_service_plist(args)?)?;
+    let out = run_launchctl(&["bootstrap", &launchd_domain(), path.to_string_lossy().as_ref()])?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "launchctl bootstrap failed: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let _ = run_launchctl(&["kickstart", "-k", &launchd_target()]);
+    wait_for_service_daemon().await?;
+    println!("Installed and started Starling daemon service at {}", path.display());
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn install_daemon_service(_args: &DaemonArgs) -> anyhow::Result<()> {
+    anyhow::bail!("daemon service management is currently implemented for macOS launchd only")
+}
+
+#[cfg(target_os = "macos")]
+async fn uninstall_daemon_service() -> anyhow::Result<()> {
+    if service_loaded() {
+        let out = run_launchctl(&["bootout", &launchd_target()])?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "launchctl bootout failed: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    let path = launch_agent_path()?;
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+    }
+    println!("Uninstalled Starling daemon service.");
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn uninstall_daemon_service() -> anyhow::Result<()> {
+    anyhow::bail!("daemon service management is currently implemented for macOS launchd only")
+}
+
+#[cfg(target_os = "macos")]
+async fn start_daemon_service() -> anyhow::Result<()> {
+    let path = launch_agent_path()?;
+    if !path.exists() {
+        anyhow::bail!(
+            "Starling daemon service is not installed; run `starling daemon install-service` first"
+        );
+    }
+    if !service_loaded() {
+        let out = run_launchctl(&["bootstrap", &launchd_domain(), path.to_string_lossy().as_ref()])?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "launchctl bootstrap failed: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    let _ = run_launchctl(&["kickstart", "-k", &launchd_target()]);
+    wait_for_service_daemon().await?;
+    println!("Started Starling daemon service.");
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn start_daemon_service() -> anyhow::Result<()> {
+    anyhow::bail!("daemon service management is currently implemented for macOS launchd only")
+}
+
+#[cfg(target_os = "macos")]
+async fn stop_daemon_service() -> anyhow::Result<()> {
+    if service_loaded() {
+        let out = run_launchctl(&["bootout", &launchd_target()])?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "launchctl bootout failed: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    let client = DaemonClient::new();
+    for _ in 0..40 {
+        if !client.is_running().await {
+            println!("Stopped Starling daemon service.");
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::bail!("service was stopped, but the daemon socket is still responding")
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn stop_daemon_service() -> anyhow::Result<()> {
+    anyhow::bail!("daemon service management is currently implemented for macOS launchd only")
+}
+
+#[cfg(target_os = "macos")]
+async fn daemon_service_status() -> anyhow::Result<()> {
+    let path = launch_agent_path()?;
+    let loaded = service_loaded();
+    let daemon = DaemonClient::new().is_running().await;
+    println!("Service: {}", DAEMON_SERVICE_LABEL);
+    println!("Plist: {}", path.display());
+    println!("Installed: {}", if path.exists() { "yes" } else { "no" });
+    println!("Loaded: {}", if loaded { "yes" } else { "no" });
+    println!("Daemon responding: {}", if daemon { "yes" } else { "no" });
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn daemon_service_status() -> anyhow::Result<()> {
+    anyhow::bail!("daemon service management is currently implemented for macOS launchd only")
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_for_service_daemon() -> anyhow::Result<()> {
+    let client = DaemonClient::new();
+    for _ in 0..80 {
+        if client.is_running().await {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::bail!(
+        "service started, but the daemon did not respond within 8s; see {}",
+        daemon::protocol::log_path().display()
+    )
 }
 
 async fn request_daemon_shutdown(client: &DaemonClient) -> anyhow::Result<Vec<InstanceState>> {
