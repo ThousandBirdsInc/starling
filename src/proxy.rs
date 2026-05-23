@@ -7,10 +7,12 @@
 //! bidirectional byte copy, injects `X-Forwarded-*` headers, and detects
 //! forwarding loops via `x-portless-hops`.
 
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 
 /// Max hops before a request is rejected as a forwarding loop (matches portless).
 const MAX_PROXY_HOPS: u32 = 5;
@@ -36,17 +38,28 @@ impl ProxyRegistry {
     }
 
     /// Register (or replace) a route for `hostname`.
-    pub fn register(&self, hostname: &str, port: u16) {
+    pub fn register(&self, hostname: &str, port: u16) -> Option<u16> {
         let mut routes = self.routes.write().unwrap();
+        let previous = routes
+            .iter()
+            .find(|r| r.hostname == hostname)
+            .map(|r| r.port);
         routes.retain(|r| r.hostname != hostname);
         routes.push(Route {
             hostname: hostname.to_string(),
             port,
         });
+        previous
     }
 
-    pub fn remove(&self, hostname: &str) {
-        self.routes.write().unwrap().retain(|r| r.hostname != hostname);
+    pub fn remove(&self, hostname: &str) -> Option<u16> {
+        let mut routes = self.routes.write().unwrap();
+        let previous = routes
+            .iter()
+            .find(|r| r.hostname == hostname)
+            .map(|r| r.port);
+        routes.retain(|r| r.hostname != hostname);
+        previous
     }
 
     pub fn snapshot(&self) -> Vec<Route> {
@@ -73,9 +86,17 @@ pub struct ProxyConfig {
     pub registry: ProxyRegistry,
     pub tld: String,
     pub proxy_port: u16,
+    pub leased_ports: Arc<Mutex<HashSet<u16>>>,
     /// Reserved for future HTTPS support; currently always false.
     #[allow(dead_code)]
     pub tls: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortReservation {
+    pub port: u16,
+    pub preferred: Option<u16>,
+    pub conflict: bool,
 }
 
 /// How the engine allocates ports and registers named routes: either through
@@ -131,19 +152,43 @@ impl ProxyHandle {
         format_url(&self.hostname(label), self.proxy_port(), self.tls())
     }
 
-    /// Lease a free backend port.
-    pub async fn allocate_port(&self) -> Option<u16> {
+    /// Reserve a backend port, preferring the requested port if it is free.
+    pub async fn reserve_port(&self, preferred: Option<u16>) -> Option<PortReservation> {
         match self {
-            ProxyHandle::Local(_) => find_free_port().await.ok(),
-            ProxyHandle::Daemon { client, instance, .. } => {
+            ProxyHandle::Local(c) => reserve_local_port(c, preferred).await,
+            ProxyHandle::Daemon {
+                client, instance, ..
+            } => {
                 use crate::daemon::protocol::{Request, Response};
                 match client
-                    .call(&Request::AllocatePort {
+                    .call(&Request::ReservePort {
                         instance: instance.clone(),
+                        preferred,
                     })
                     .await
                 {
-                    Ok(Response::Port { port }) => Some(port),
+                    Ok(Response::ReservedPort {
+                        port,
+                        preferred,
+                        conflict,
+                    }) => Some(PortReservation {
+                        port,
+                        preferred,
+                        conflict,
+                    }),
+                    Ok(Response::Error(_)) => match client
+                        .call(&Request::AllocatePort {
+                            instance: instance.clone(),
+                        })
+                        .await
+                    {
+                        Ok(Response::Port { port }) => Some(PortReservation {
+                            port,
+                            preferred,
+                            conflict: preferred.is_some(),
+                        }),
+                        _ => None,
+                    },
                     _ => None,
                 }
             }
@@ -154,8 +199,17 @@ impl ProxyHandle {
     pub async fn register(&self, label: &str, port: u16) {
         let host = self.hostname(label);
         match self {
-            ProxyHandle::Local(c) => c.registry.register(&host, port),
-            ProxyHandle::Daemon { client, instance, .. } => {
+            ProxyHandle::Local(c) => {
+                let previous = c.registry.register(&host, port);
+                let mut leased = c.leased_ports.lock().await;
+                leased.insert(port);
+                if let Some(previous) = previous {
+                    release_local_port_if_unused(c, &mut leased, previous);
+                }
+            }
+            ProxyHandle::Daemon {
+                client, instance, ..
+            } => {
                 use crate::daemon::protocol::Request;
                 let _ = client
                     .call(&Request::RegisterRoute {
@@ -171,12 +225,55 @@ impl ProxyHandle {
     pub async fn remove(&self, label: &str) {
         let host = self.hostname(label);
         match self {
-            ProxyHandle::Local(c) => c.registry.remove(&host),
+            ProxyHandle::Local(c) => {
+                let previous = c.registry.remove(&host);
+                if let Some(previous) = previous {
+                    let mut leased = c.leased_ports.lock().await;
+                    release_local_port_if_unused(c, &mut leased, previous);
+                }
+            }
             ProxyHandle::Daemon { client, .. } => {
                 use crate::daemon::protocol::Request;
                 let _ = client.call(&Request::RemoveRoute { hostname: host }).await;
             }
         }
+    }
+}
+
+async fn reserve_local_port(
+    config: &ProxyConfig,
+    preferred: Option<u16>,
+) -> Option<PortReservation> {
+    if let Some(port) = preferred {
+        let mut leased = config.leased_ports.lock().await;
+        if !leased.contains(&port) && port_available(port).await {
+            leased.insert(port);
+            return Some(PortReservation {
+                port,
+                preferred,
+                conflict: false,
+            });
+        }
+    }
+
+    for _ in 0..50 {
+        if let Ok(port) = find_free_port().await {
+            let mut leased = config.leased_ports.lock().await;
+            if leased.insert(port) {
+                return Some(PortReservation {
+                    port,
+                    preferred,
+                    conflict: preferred.is_some(),
+                });
+            }
+        }
+    }
+    None
+}
+
+fn release_local_port_if_unused(config: &ProxyConfig, leased: &mut HashSet<u16>, port: u16) {
+    if !config.registry.snapshot().iter().any(|r| r.port == port) {
+        leased.remove(&port);
     }
 }
 
@@ -214,6 +311,11 @@ pub async fn find_free_port() -> std::io::Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     Ok(port)
+}
+
+/// Test whether a specific TCP port is bindable on 127.0.0.1.
+pub async fn port_available(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).await.is_ok()
 }
 
 /// Run the proxy server until the listener errors.

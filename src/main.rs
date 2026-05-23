@@ -20,13 +20,13 @@ mod starlingfile;
 mod store;
 mod tui;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::daemon::client::DaemonClient;
 use crate::daemon::protocol::{
@@ -1214,6 +1214,7 @@ async fn up(args: UpArgs) {
 
     let (build_tx, build_rx) = mpsc::unbounded_channel::<String>();
     let (restart_tx, restart_rx) = mpsc::unbounded_channel::<String>();
+    let (port_tx, port_rx) = mpsc::unbounded_channel::<(String, u16)>();
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
     let store = Arc::new(Store::new(build_tx.clone()));
     store.set_restart_tx(restart_tx);
@@ -1224,10 +1225,13 @@ async fn up(args: UpArgs) {
         None
     } else if args.no_daemon {
         let registry = ProxyRegistry::new();
+        let leased_ports = Arc::new(Mutex::new(HashSet::new()));
+        leased_ports.lock().await.insert(args.port);
         let cfg = ProxyConfig {
             registry: registry.clone(),
             tld: args.tld.clone(),
             proxy_port: args.proxy_port,
+            leased_ports,
             tls: args.tls,
         };
         registry.register(&format!("starling.{}", args.tld), args.port);
@@ -1308,6 +1312,7 @@ async fn up(args: UpArgs) {
                 config_path.clone(),
                 result.config_files,
                 restart_rx,
+                port_rx,
                 proxy_handle.clone(),
             );
             tokio::spawn(eng.run());
@@ -1326,6 +1331,7 @@ async fn up(args: UpArgs) {
     // Reporter: push state to the daemon and execute queued commands.
     if let Some((client, instance)) = daemon_instance.clone() {
         let store = store.clone();
+        let port_tx = port_tx.clone();
         let shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(1000));
@@ -1356,6 +1362,9 @@ async fn up(args: UpArgs) {
                             }
                             DaemonCommand::Restart { resource } => {
                                 let _ = store.restart(&resource);
+                            }
+                            DaemonCommand::SetPort { resource, port } => {
+                                let _ = port_tx.send((resource, port));
                             }
                             DaemonCommand::Shutdown => {
                                 let _ = shutdown_tx.send(());

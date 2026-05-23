@@ -50,6 +50,10 @@ pub struct Engine {
     watcher_generation: Arc<AtomicU64>,
     /// Restart requests (resource names) from the dashboard.
     restart_rx: mpsc::UnboundedReceiver<String>,
+    /// Preferred port changes from the dashboard.
+    port_rx: mpsc::UnboundedReceiver<(String, u16)>,
+    /// Session-scoped preferred port overrides from the dashboard.
+    port_overrides: HashMap<String, u16>,
     /// Named-URL proxy handle (daemon or local); `None` disables named URLs.
     proxy: Option<crate::proxy::ProxyHandle>,
 }
@@ -70,6 +74,7 @@ impl Engine {
         config_path: PathBuf,
         config_files: Vec<PathBuf>,
         restart_rx: mpsc::UnboundedReceiver<String>,
+        port_rx: mpsc::UnboundedReceiver<(String, u16)>,
         proxy: Option<crate::proxy::ProxyHandle>,
     ) -> Self {
         let by_name = manifests
@@ -90,6 +95,8 @@ impl Engine {
             serve_tasks: HashMap::new(),
             watcher_generation: Arc::new(AtomicU64::new(0)),
             restart_rx,
+            port_rx,
+            port_overrides: HashMap::new(),
             proxy,
         }
     }
@@ -164,6 +171,10 @@ impl Engine {
                     let Some(name) = restart else { continue };
                     self.restart(&name).await;
                 }
+                port = self.port_rx.recv() => {
+                    let Some((name, port)) = port else { continue };
+                    self.change_port(&name, port).await;
+                }
             }
         }
     }
@@ -213,12 +224,14 @@ impl Engine {
             .filter(|n| !new_names.contains(n))
             .collect();
         for name in removed {
+            self.port_overrides.remove(&name);
             self.stop_serve(&name, "Stopping serve_cmd; resource was removed...\n")
                 .await;
             self.store.remove_resource(&name);
         }
 
         self.manifests = result.manifests;
+        self.apply_port_overrides();
         self.config_files = result.config_files;
         self.reindex();
         let stopped_serves: Vec<String> = self
@@ -248,6 +261,14 @@ impl Engine {
         );
         for name in self.initial_build_order() {
             self.run_build(&name).await;
+        }
+    }
+
+    fn apply_port_overrides(&mut self) {
+        for m in &mut self.manifests {
+            if let Some(port) = self.port_overrides.get(&m.name) {
+                m.serve_port = Some(*port);
+            }
         }
     }
 
@@ -375,16 +396,36 @@ impl Engine {
             } else {
                 None
             };
-            let port = match (m.serve_port, &proxy) {
-                (Some(p), _) => Some(p),
-                (None, Some(handle)) => handle.allocate_port().await,
+            let reservation = match (m.serve_port, &proxy) {
+                (Some(p), Some(handle)) => handle.reserve_port(Some(p)).await,
+                (Some(p), None) => Some(crate::proxy::PortReservation {
+                    port: p,
+                    preferred: Some(p),
+                    conflict: false,
+                }),
+                (None, Some(handle)) => handle.reserve_port(None).await,
                 (None, None) => None,
             };
+            let port = reservation.as_ref().map(|r| r.port);
             if let Some(p) = port {
                 m.serve_cmd.env.push(("PORT".to_string(), p.to_string()));
                 m.serve_cmd
                     .env
                     .push(("HOST".to_string(), "127.0.0.1".to_string()));
+            }
+            if let Some(reservation) = &reservation {
+                if reservation.conflict {
+                    if let Some(preferred) = reservation.preferred {
+                        store.append_log(
+                            Some(&name),
+                            "WARN",
+                            &format!(
+                                "Configured serve_port={preferred} is unavailable or already claimed by another route; using fallback PORT={}. Make serve_cmd bind to $PORT for fallback to work.\n",
+                                reservation.port
+                            ),
+                        );
+                    }
+                }
             }
             if let (Some(handle), Some(p)) = (&proxy, port) {
                 let host = handle.hostname(&name);
@@ -490,6 +531,30 @@ impl Engine {
                 self.spawn_serve(m);
             }
         }
+    }
+
+    async fn change_port(&mut self, name: &str, port: u16) {
+        let Some(&i) = self.by_name.get(name) else {
+            self.store
+                .append_log(Some(name), "ERROR", "Cannot change port: resource not found\n");
+            return;
+        };
+        if self.manifests[i].serve_cmd.is_empty() {
+            self.store.append_log(
+                Some(name),
+                "ERROR",
+                "Cannot change port: resource has no serve_cmd\n",
+            );
+            return;
+        }
+        self.manifests[i].serve_port = Some(port);
+        self.port_overrides.insert(name.to_string(), port);
+        self.store.append_log(
+            Some(name),
+            "INFO",
+            &format!("Changing preferred serve_port to {port}; restarting serve_cmd...\n"),
+        );
+        self.restart(name).await;
     }
 
     async fn stop_serve(&mut self, name: &str, message: &str) {
@@ -1225,7 +1290,7 @@ impl ServeRouteMonitor {
                 Some(&name),
                 "WARN",
                 &format!(
-                    "Detected serve_cmd listening on 127.0.0.1:{detected_port}; updated named route from PORT={previous_port}. Set serve_port={detected_port} or make serve_cmd use $PORT to avoid this.\n"
+                    "Detected serve_cmd listening on 127.0.0.1:{detected_port}; updated named route from PORT={previous_port}. This usually means the command ignored $PORT; set serve_port={detected_port} or make serve_cmd bind to $PORT to avoid this.\n"
                 ),
             );
         });

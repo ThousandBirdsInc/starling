@@ -183,11 +183,12 @@ unchanged.
 
 In the **TUI**: `j`/`k` (or ↑/↓) move, `↵` opens a detail view, `o` opens the
 selected resource's URL in the browser, `l` opens full-screen logs, `t` triggers,
-`R` restarts, `/` filters resources, `r` refreshes, `q` quits. The table shows
+`R` restarts, `p` changes the preferred backend port, `/` filters resources,
+`r` refreshes, `q` quits. The table shows
 every instance's resources (instance · resource · type · update · runtime · pod ·
-URL) with a live log pane for the selection. In full-screen logs, `/` filters log
-lines by regex (case-insensitive, with substring fallback) and `PgUp`/`PgDn`
-scroll.
+backend port · URL) with a live log pane for the selection. In full-screen logs,
+`/` filters log lines by regex (case-insensitive, with substring fallback) and
+`PgUp`/`PgDn` scroll.
 
 The bundled `./Starlingfile` demonstrates `local_resource` (one-shot `cmd`,
 dependency ordering, a `serve_cmd` that gets a named URL, and `deps` file-watch
@@ -241,7 +242,9 @@ reverse proxy.
 - The Starling UI itself is mounted at `starling.<tld>`.
 - `alias(name, port)` (Starlingfile builtin) registers a static route to any
   already-running server — a Docker container, a k8s port-forward, etc.
-- `local_resource(..., serve_port=N)` pins a fixed port instead of auto-assigning.
+- `local_resource(..., serve_port=N)` prefers a fixed port; if that port is busy
+  or already claimed by another route, Starling falls back to a free `$PORT` and
+  logs a warning.
 
 `.localhost` hostnames resolve to `127.0.0.1` automatically in browsers, so the
 URLs just work. Flags: `--proxy-port` (default `1360`), `--tld` (default
@@ -302,8 +305,8 @@ A working dev tool for local + Kubernetes resources.
     `starling trust` to install the CA, `starling hosts` to sync `/etc/hosts` for
     non-`.localhost` TLDs, plain-HTTP→HTTPS redirect on the same port.
     `--lan` (mDNS) and `--tailscale` modes are wired but experimental.
-13. ✅ TUI: `/` filter, Enter detail view, `t` trigger, `R` restart, PgUp/PgDn
-    log scroll.
+13. ✅ TUI: `/` filter, Enter detail view, `t` trigger, `R` restart, `p` change
+    preferred backend port, PgUp/PgDn log scroll.
 14. ✅ Tiltfile API parity: corrected `local_resource` arg order, `trigger_mode`
     (+ manual-mode pending behavior), full `local`/`local_resource` kwargs
     (env/dir/serve_env/serve_dir/labels), `custom_build`, `kustomize`/`helm`,

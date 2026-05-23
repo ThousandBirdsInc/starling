@@ -9,6 +9,7 @@
 //!   Enter      detail view for the selected resource (Esc to exit)
 //!   t          trigger the selected resource
 //!   R          restart the selected resource's serve_cmd
+//!   p          change the selected resource's preferred backend port
 //!   PgUp/PgDn  scroll logs (G / End jumps back to follow)
 //!   r          refresh now
 //!   q          quit
@@ -42,6 +43,7 @@ struct RowItem {
     runtime: String,
     pod: String,
     url: String,
+    route_port: Option<u16>,
 }
 
 #[derive(PartialEq)]
@@ -53,6 +55,8 @@ enum Mode {
     Logs,
     /// Typing a log-line filter (regex) while in full-screen logs.
     LogsFilter,
+    /// Typing a new preferred backend port for the selected resource.
+    PortEdit,
 }
 
 pub async fn run(proxy_port: u16, tld: &str, tls: bool) {
@@ -92,6 +96,8 @@ struct App {
     log_filter: String,
     /// Lines scrolled up from the bottom; 0 = follow tail.
     log_scroll: usize,
+    /// Port being edited in the footer.
+    port_input: String,
     status_msg: String,
 }
 
@@ -137,6 +143,7 @@ async fn event_loop(
         filter: String::new(),
         log_filter: String::new(),
         log_scroll: 0,
+        port_input: String::new(),
         status_msg: String::new(),
     };
     let mut last_refresh = Instant::now() - Duration::from_secs(1);
@@ -199,6 +206,46 @@ async fn event_loop(
                         KeyCode::Char(c) => {
                             app.log_filter.push(c);
                             app.log_scroll = 0;
+                        }
+                        _ => {}
+                    },
+                    Mode::PortEdit => match key.code {
+                        KeyCode::Enter => match parse_port(&app.port_input) {
+                            Some(port) => {
+                                if let Some(r) = app.selected().cloned() {
+                                    let resp = client
+                                        .call(&Request::SetPort {
+                                            instance: r.instance_id.clone(),
+                                            resource: r.name.clone(),
+                                            port,
+                                        })
+                                        .await;
+                                    app.status_msg = match resp {
+                                        Ok(Response::Ok) => {
+                                            format!("changing {} to port {port}", r.name)
+                                        }
+                                        Ok(Response::Error(e)) => {
+                                            format!("couldn't change port: {e}")
+                                        }
+                                        Ok(other) => format!("unexpected daemon response: {other:?}"),
+                                        Err(e) => format!("couldn't change port: {e}"),
+                                    };
+                                }
+                                app.mode = Mode::Normal;
+                            }
+                            None => {
+                                app.status_msg = "port must be 1-65535".to_string();
+                            }
+                        },
+                        KeyCode::Esc => {
+                            app.port_input.clear();
+                            app.mode = Mode::Normal;
+                        }
+                        KeyCode::Backspace => {
+                            app.port_input.pop();
+                        }
+                        KeyCode::Char(c) if c.is_ascii_digit() => {
+                            app.port_input.push(c);
                         }
                         _ => {}
                     },
@@ -274,6 +321,15 @@ async fn event_loop(
                                 app.status_msg = format!("restarting {}", r.name);
                             }
                         }
+                        KeyCode::Char('p') => {
+                            if let Some(r) = app.selected() {
+                                app.port_input = r
+                                    .route_port
+                                    .map(|p| p.to_string())
+                                    .unwrap_or_default();
+                                app.mode = Mode::PortEdit;
+                            }
+                        }
                         KeyCode::Char('o') => {
                             match app.selected() {
                                 Some(r) if !r.url.is_empty() => {
@@ -341,6 +397,7 @@ fn filtered(state: &DashboardState, filter: &str) -> Vec<RowItem> {
                 runtime: r.runtime_status.clone(),
                 pod: r.pod.clone().unwrap_or_default(),
                 url: r.url.clone().unwrap_or_default(),
+                route_port: route_port_for_url(state, &inst.id, r.url.as_deref()),
             };
             if f.is_empty()
                 || item.name.to_ascii_lowercase().contains(&f)
@@ -351,6 +408,29 @@ fn filtered(state: &DashboardState, filter: &str) -> Vec<RowItem> {
         }
     }
     rows
+}
+
+fn route_port_for_url(state: &DashboardState, instance: &str, url: Option<&str>) -> Option<u16> {
+    let host = hostname_from_url(url?)?;
+    state
+        .routes
+        .iter()
+        .find(|r| r.instance == instance && r.hostname == host)
+        .map(|r| r.port)
+}
+
+fn hostname_from_url(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    if authority.is_empty() {
+        return None;
+    }
+    Some(authority.split(':').next().unwrap_or(authority).to_string())
+}
+
+fn parse_port(input: &str) -> Option<u16> {
+    let port = input.parse::<u16>().ok()?;
+    (port != 0).then_some(port)
 }
 
 async fn fetch_logs(client: &DaemonClient, instance: &str, resource: &str) -> Vec<String> {
@@ -427,7 +507,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     );
 
     let header = Row::new(
-        ["INSTANCE", "RESOURCE", "TYPE", "UPDATE", "RUNTIME", "POD", "URL"]
+        ["INSTANCE", "RESOURCE", "TYPE", "UPDATE", "RUNTIME", "PORT", "POD", "URL"]
             .iter()
             .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD))),
     );
@@ -441,6 +521,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 Cell::from(r.kind.clone()),
                 Cell::from(r.update.clone()).style(status_style(&r.update)),
                 Cell::from(r.runtime.clone()).style(status_style(&r.runtime)),
+                Cell::from(r.route_port.map(|p| p.to_string()).unwrap_or_default()),
                 Cell::from(r.pod.clone()),
                 Cell::from(r.url.clone()).style(Style::default().fg(Color::Blue)),
             ])
@@ -452,6 +533,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Length(6),
         Constraint::Length(12),
         Constraint::Length(14),
+        Constraint::Length(7),
         Constraint::Length(20),
         Constraint::Min(20),
     ];
@@ -485,15 +567,20 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     let footer = if app.mode == Mode::Filter {
         format!(" /{}\u{2588}   (Enter apply · Esc clear) ", app.filter)
+    } else if app.mode == Mode::PortEdit {
+        format!(
+            " port {}{}   (Enter apply · Esc cancel) ",
+            app.port_input, "\u{2588}"
+        )
     } else if app.rows.is_empty() {
         " No resources. Run `starling up` in a project.   [/] filter  [q] quit ".to_string()
     } else if !app.status_msg.is_empty() {
         format!(
-            " {}   ·   [↵] detail [o] open [l] logs [t] trigger [R] restart [/] filter [q] quit ",
+            " {}   ·   [↵] detail [o] open [l] logs [t] trigger [R] restart [p] port [/] filter [q] quit ",
             app.status_msg
         )
     } else {
-        " [j/k] move  [↵] detail  [l] logs  [o] open url  [t] trigger  [R] restart  [/] filter  [q] quit "
+        " [j/k] move  [↵] detail  [l] logs  [o] open url  [t] trigger  [R] restart  [p] port  [/] filter  [q] quit "
             .to_string()
     };
     f.render_widget(
@@ -507,7 +594,7 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Length(8),
+            Constraint::Length(10),
             Constraint::Min(4),
             Constraint::Length(1),
         ])
@@ -522,6 +609,7 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
         runtime: String::new(),
         pod: String::new(),
         url: String::new(),
+        route_port: None,
     });
 
     f.render_widget(
@@ -540,6 +628,7 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
         Line::from(vec![Span::styled("type:     ", bold()), Span::raw(r.kind.clone())]),
         Line::from(vec![Span::styled("update:   ", bold()), Span::styled(r.update.clone(), status_style(&r.update))]),
         Line::from(vec![Span::styled("runtime:  ", bold()), Span::styled(r.runtime.clone(), status_style(&r.runtime))]),
+        Line::from(vec![Span::styled("port:     ", bold()), Span::raw(r.route_port.map(|p| p.to_string()).unwrap_or_default())]),
         Line::from(vec![Span::styled("pod:      ", bold()), Span::raw(r.pod.clone())]),
         Line::from(vec![Span::styled("url:      ", bold()), Span::styled(r.url.clone(), Style::default().fg(Color::Blue))]),
     ];
@@ -557,7 +646,7 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
 
     f.render_widget(
         Paragraph::new(Span::styled(
-            " [Esc/↵] back  [l] full logs  [o] open url  [t] trigger  [R] restart  [PgUp/Dn] scroll  [q] quit ",
+            " [Esc/↵] back  [l] full logs  [o] open url  [t] trigger  [R] restart  [p] port  [PgUp/Dn] scroll  [q] quit ",
             Style::default().fg(Color::Gray),
         )),
         chunks[3],
@@ -570,7 +659,8 @@ fn bold() -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::filter_log_lines;
+    use super::{filter_log_lines, hostname_from_url, parse_port, route_port_for_url};
+    use crate::daemon::protocol::{DashboardState, RouteInfo};
 
     #[test]
     fn log_filter_regex_substring_and_empty() {
@@ -587,6 +677,49 @@ mod tests {
         assert_eq!(filter_log_lines(&logs, r"\b5\d\d\b"), vec!["GET /users 500"]);
         // invalid regex falls back to substring (no panic)
         assert_eq!(filter_log_lines(&logs, "GET [").len(), 0);
+    }
+
+    #[test]
+    fn parses_valid_backend_ports() {
+        assert_eq!(parse_port("1"), Some(1));
+        assert_eq!(parse_port("65535"), Some(65535));
+        assert_eq!(parse_port("0"), None);
+        assert_eq!(parse_port("65536"), None);
+        assert_eq!(parse_port("abc"), None);
+    }
+
+    #[test]
+    fn extracts_hostname_from_named_url() {
+        assert_eq!(
+            hostname_from_url("http://web-app.localhost:1360/path"),
+            Some("web-app.localhost".to_string())
+        );
+        assert_eq!(
+            hostname_from_url("https://api.localhost"),
+            Some("api.localhost".to_string())
+        );
+        assert_eq!(hostname_from_url(""), None);
+    }
+
+    #[test]
+    fn finds_backend_port_for_selected_route() {
+        let state = DashboardState {
+            routes: vec![RouteInfo {
+                hostname: "web.localhost".to_string(),
+                port: 8080,
+                instance: "inst".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            route_port_for_url(&state, "inst", Some("http://web.localhost:1360")),
+            Some(8080)
+        );
+        assert_eq!(
+            route_port_for_url(&state, "other", Some("http://web.localhost:1360")),
+            None
+        );
     }
 }
 

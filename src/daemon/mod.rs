@@ -34,7 +34,7 @@ struct Instance {
 struct Inner {
     instances: HashMap<String, Instance>,
     seq: u64,
-    leased_ports: std::collections::HashSet<u16>,
+    leased_ports: HashMap<u16, String>,
     routes: Vec<RouteInfo>,
     shutting_down: bool,
     /// mDNS advertiser processes (kept alive while routes are active).
@@ -183,6 +183,7 @@ impl Daemon {
                 let mut inner = self.inner.lock().await;
                 inner.instances.remove(&instance);
                 inner.routes.retain(|r| r.instance != instance);
+                inner.leased_ports.retain(|_, owner| owner != &instance);
                 // Re-sync the proxy registry with the surviving routes.
                 self.resync_registry(&inner);
                 Response::Ok
@@ -212,18 +213,27 @@ impl Daemon {
                 }
             }
 
-            Request::AllocatePort { instance: _ } => {
+            Request::AllocatePort { instance } => {
                 // Find a free port not already leased.
-                for _ in 0..50 {
-                    if let Ok(port) = proxy::find_free_port().await {
-                        let mut inner = self.inner.lock().await;
-                        if inner.leased_ports.insert(port) {
-                            return Response::Port { port };
-                        }
-                    }
+                match self.reserve_port(&instance, None).await {
+                    Some(reservation) => Response::Port {
+                        port: reservation.port,
+                    },
+                    None => Response::Error("could not allocate a free port".into()),
                 }
-                Response::Error("could not allocate a free port".into())
             }
+
+            Request::ReservePort {
+                instance,
+                preferred,
+            } => match self.reserve_port(&instance, preferred).await {
+                Some(reservation) => Response::ReservedPort {
+                    port: reservation.port,
+                    preferred: reservation.preferred,
+                    conflict: reservation.conflict,
+                },
+                None => Response::Error("could not allocate a free port".into()),
+            },
 
             Request::RegisterRoute {
                 instance,
@@ -237,7 +247,16 @@ impl Daemon {
                     }
                 }
                 let mut inner = self.inner.lock().await;
+                let previous = inner
+                    .routes
+                    .iter()
+                    .find(|r| r.hostname == hostname)
+                    .map(|r| r.port);
                 inner.routes.retain(|r| r.hostname != hostname);
+                if let Some(previous) = previous {
+                    release_port_if_unused(&mut inner, previous);
+                }
+                inner.leased_ports.insert(port, instance.clone());
                 inner.routes.push(RouteInfo {
                     hostname,
                     port,
@@ -249,7 +268,15 @@ impl Daemon {
             Request::RemoveRoute { hostname } => {
                 self.registry.remove(&hostname);
                 let mut inner = self.inner.lock().await;
+                let previous = inner
+                    .routes
+                    .iter()
+                    .find(|r| r.hostname == hostname)
+                    .map(|r| r.port);
                 inner.routes.retain(|r| r.hostname != hostname);
+                if let Some(previous) = previous {
+                    release_port_if_unused(&mut inner, previous);
+                }
                 Response::Ok
             }
 
@@ -304,6 +331,20 @@ impl Daemon {
                 let mut inner = self.inner.lock().await;
                 if let Some(inst) = inner.instances.get_mut(&instance) {
                     inst.commands.push(Command::Restart { resource });
+                    Response::Ok
+                } else {
+                    Response::Error(format!("unknown instance {instance}"))
+                }
+            }
+
+            Request::SetPort {
+                instance,
+                resource,
+                port,
+            } => {
+                let mut inner = self.inner.lock().await;
+                if let Some(inst) = inner.instances.get_mut(&instance) {
+                    inst.commands.push(Command::SetPort { resource, port });
                     Response::Ok
                 } else {
                     Response::Error(format!("unknown instance {instance}"))
@@ -365,7 +406,45 @@ impl Daemon {
             inner.instances.remove(id);
         }
         inner.routes.retain(|r| !dead.contains(&r.instance));
+        inner
+            .leased_ports
+            .retain(|_, owner| !dead.iter().any(|id| id == owner));
         self.resync_registry(inner);
+    }
+
+    async fn reserve_port(
+        &self,
+        instance: &str,
+        preferred: Option<u16>,
+    ) -> Option<proxy::PortReservation> {
+        if let Some(port) = preferred {
+            let mut inner = self.inner.lock().await;
+            if !inner.leased_ports.contains_key(&port) && proxy::port_available(port).await {
+                inner.leased_ports.insert(port, instance.to_string());
+                return Some(proxy::PortReservation {
+                    port,
+                    preferred,
+                    conflict: false,
+                });
+            }
+        }
+
+        for _ in 0..50 {
+            if let Ok(port) = proxy::find_free_port().await {
+                let mut inner = self.inner.lock().await;
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    inner.leased_ports.entry(port)
+                {
+                    entry.insert(instance.to_string());
+                    return Some(proxy::PortReservation {
+                        port,
+                        preferred,
+                        conflict: preferred.is_some(),
+                    });
+                }
+            }
+        }
+        None
     }
 
     /// Rebuild the proxy registry from the authoritative route list.
@@ -381,6 +460,12 @@ impl Daemon {
     }
 }
 
+fn release_port_if_unused(inner: &mut Inner, port: u16) {
+    if !inner.routes.iter().any(|r| r.port == port) {
+        inner.leased_ports.remove(&port);
+    }
+}
+
 fn sanitize(name: &str) -> String {
     let s: String = name
         .chars()
@@ -391,5 +476,87 @@ fn sanitize(name: &str) -> String {
         "app".into()
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_daemon() -> Daemon {
+        Daemon {
+            inner: Mutex::new(Inner::default()),
+            registry: ProxyRegistry::new(),
+            proxy_port: 1360,
+            tld: "localhost".to_string(),
+            lan: false,
+            lan_ip: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reserves_preferred_port_when_available() {
+        let daemon = test_daemon();
+        let port = proxy::find_free_port().await.unwrap();
+
+        let reservation = daemon.reserve_port("inst", Some(port)).await.unwrap();
+
+        assert_eq!(reservation.port, port);
+        assert_eq!(reservation.preferred, Some(port));
+        assert!(!reservation.conflict);
+    }
+
+    #[tokio::test]
+    async fn falls_back_when_preferred_port_is_leased() {
+        let daemon = test_daemon();
+        let port = proxy::find_free_port().await.unwrap();
+        let first = daemon.reserve_port("inst-a", Some(port)).await.unwrap();
+
+        let fallback = daemon
+            .reserve_port("inst-b", Some(first.port))
+            .await
+            .unwrap();
+
+        assert_ne!(fallback.port, first.port);
+        assert_eq!(fallback.preferred, Some(first.port));
+        assert!(fallback.conflict);
+    }
+
+    #[tokio::test]
+    async fn falls_back_when_preferred_port_is_bound_elsewhere() {
+        let daemon = test_daemon();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let busy_port = listener.local_addr().unwrap().port();
+
+        let fallback = daemon.reserve_port("inst", Some(busy_port)).await.unwrap();
+
+        assert_ne!(fallback.port, busy_port);
+        assert_eq!(fallback.preferred, Some(busy_port));
+        assert!(fallback.conflict);
+    }
+
+    #[tokio::test]
+    async fn removing_route_releases_its_port() {
+        let daemon = test_daemon();
+        let port = daemon.reserve_port("inst", None).await.unwrap().port;
+        let hostname = "web.localhost".to_string();
+
+        assert!(matches!(
+            daemon
+                .handle(Request::RegisterRoute {
+                    instance: "inst".to_string(),
+                    hostname: hostname.clone(),
+                    port,
+                })
+                .await,
+            Response::Ok
+        ));
+        assert!(daemon.inner.lock().await.leased_ports.contains_key(&port));
+
+        assert!(matches!(
+            daemon.handle(Request::RemoveRoute { hostname }).await,
+            Response::Ok
+        ));
+        assert!(!daemon.inner.lock().await.leased_ports.contains_key(&port));
     }
 }

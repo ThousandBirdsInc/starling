@@ -80,6 +80,11 @@ pub enum Command {
     Restart {
         resource: String,
     },
+    /// Change a resource's preferred serve_cmd backend port and restart it.
+    SetPort {
+        resource: String,
+        port: u16,
+    },
     /// Stop this `starling up` instance.
     Shutdown,
 }
@@ -106,6 +111,12 @@ pub enum Request {
     /// Lease a free port for a serve_cmd (avoids cross-instance conflicts).
     AllocatePort {
         instance: String,
+    },
+    /// Reserve a backend port for a serve_cmd, optionally preferring a fixed
+    /// port from local_resource(..., serve_port=N).
+    ReservePort {
+        instance: String,
+        preferred: Option<u16>,
     },
     RegisterRoute {
         instance: String,
@@ -136,6 +147,12 @@ pub enum Request {
         instance: String,
         resource: String,
     },
+    /// Dashboard: change a resource's preferred serve_cmd backend port.
+    SetPort {
+        instance: String,
+        resource: String,
+        port: u16,
+    },
     /// CLI: ask every instance registered for this project directory to stop.
     ShutdownProject {
         dir: String,
@@ -149,6 +166,11 @@ pub enum Response {
     Ok,
     Registered { instance: String },
     Port { port: u16 },
+    ReservedPort {
+        port: u16,
+        preferred: Option<u16>,
+        conflict: bool,
+    },
     State(DashboardState),
     Logs(Vec<String>),
     Commands(Vec<Command>),
