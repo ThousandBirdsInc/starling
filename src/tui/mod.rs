@@ -199,66 +199,172 @@ impl App {
     }
 }
 
-/// Make a line of externally-sourced text safe to put into ratatui's cell
-/// buffer.
-///
-/// Process logs routinely carry ANSI/VT escape sequences (colors, cursor
-/// moves) and other control bytes. ratatui copies a string's bytes verbatim
-/// into its grid and has no notion of escape sequences, so an unescaped `\x1b`
-/// is written straight to the terminal — bleeding colors and jumping the
-/// cursor across the whole UI. This strips those sequences and control
-/// characters while preserving every printable character, **including emoji**,
-/// so text still renders (just without the corruption).
-fn sanitize(line: &str) -> String {
+/// Render a log line with ANSI SGR color/style codes translated into ratatui
+/// spans. Other terminal control sequences are dropped so process output can't
+/// move the cursor or corrupt the dashboard.
+fn ansi_log_line(line: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut buf = String::new();
+    let mut style = Style::default();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => {
+                flush_log_span(&mut spans, &mut buf, style);
+                consume_ansi_escape(&mut chars, Some(&mut style));
+            }
+            '\t' => buf.push_str("    "),
+            // Drop carriage returns and every other control char (C0/C1, DEL,
+            // and any stray newline within a line). Emoji and printable text
+            // are left untouched.
+            c if c.is_control() => {}
+            c => buf.push(c),
+        }
+    }
+    flush_log_span(&mut spans, &mut buf, style);
+    Line::from(spans)
+}
+
+/// Strip terminal controls from a log line for filtering/search. This mirrors
+/// `ansi_log_line` but keeps only visible text.
+fn plain_log_text(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            // ESC introduces an escape sequence; consume and drop it.
-            '\u{1b}' => match chars.peek() {
-                // CSI: ESC [ <params/intermediates> <final 0x40..=0x7e>
-                Some('[') => {
-                    chars.next();
-                    while let Some(&n) = chars.peek() {
-                        chars.next();
-                        if ('\u{40}'..='\u{7e}').contains(&n) {
-                            break;
-                        }
-                    }
-                }
-                // OSC: ESC ] ... terminated by BEL or ST (ESC \).
-                Some(']') => {
-                    chars.next();
-                    while let Some(&n) = chars.peek() {
-                        if n == '\u{7}' {
-                            chars.next();
-                            break;
-                        }
-                        if n == '\u{1b}' {
-                            chars.next();
-                            if chars.peek() == Some(&'\\') {
-                                chars.next();
-                            }
-                            break;
-                        }
-                        chars.next();
-                    }
-                }
-                // Any other two-character escape (ESC X): drop both.
-                Some(_) => {
-                    chars.next();
-                }
-                None => {}
-            },
+            '\u{1b}' => consume_ansi_escape(&mut chars, None),
             '\t' => out.push_str("    "),
-            // Drop carriage returns and every other control char (C0/C1, DEL,
-            // and any stray newline within a line). Emoji and printable text
-            // are left untouched.
             c if c.is_control() => {}
             c => out.push(c),
         }
     }
     out
+}
+
+fn flush_log_span(spans: &mut Vec<Span<'static>>, buf: &mut String, style: Style) {
+    if !buf.is_empty() {
+        spans.push(Span::styled(std::mem::take(buf), style));
+    }
+}
+
+fn consume_ansi_escape(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    mut style: Option<&mut Style>,
+) {
+    match chars.peek() {
+        Some('[') => {
+            chars.next();
+            let mut params = String::new();
+            while let Some(n) = chars.next() {
+                if ('\u{40}'..='\u{7e}').contains(&n) {
+                    if n == 'm' {
+                        if let Some(style) = style.as_deref_mut() {
+                            apply_sgr(&params, style);
+                        }
+                    }
+                    break;
+                }
+                params.push(n);
+            }
+        }
+        Some(']') => {
+            chars.next();
+            while let Some(n) = chars.next() {
+                if n == '\u{7}' {
+                    break;
+                }
+                if n == '\u{1b}' && chars.peek() == Some(&'\\') {
+                    chars.next();
+                    break;
+                }
+            }
+        }
+        Some(_) => {
+            chars.next();
+        }
+        None => {}
+    }
+}
+
+fn apply_sgr(params: &str, style: &mut Style) {
+    let codes: Vec<u16> = if params.is_empty() {
+        vec![0]
+    } else {
+        params
+            .split([';', ':'])
+            .map(|part| part.parse::<u16>().unwrap_or(0))
+            .collect()
+    };
+    let mut i = 0;
+    while i < codes.len() {
+        match codes[i] {
+            0 => *style = Style::default(),
+            1 => *style = style.add_modifier(Modifier::BOLD),
+            2 => *style = style.add_modifier(Modifier::DIM),
+            3 => *style = style.add_modifier(Modifier::ITALIC),
+            4 => *style = style.add_modifier(Modifier::UNDERLINED),
+            22 => *style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
+            23 => *style = style.remove_modifier(Modifier::ITALIC),
+            24 => *style = style.remove_modifier(Modifier::UNDERLINED),
+            30..=37 | 90..=97 => style.fg = ansi_color(codes[i]),
+            39 => style.fg = None,
+            40..=47 | 100..=107 => style.bg = ansi_bg_color(codes[i]),
+            49 => style.bg = None,
+            38 | 48 => {
+                if let Some((color, consumed)) = extended_ansi_color(&codes[i + 1..]) {
+                    if codes[i] == 38 {
+                        style.fg = Some(color);
+                    } else {
+                        style.bg = Some(color);
+                    }
+                    i += consumed;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+fn extended_ansi_color(codes: &[u16]) -> Option<(Color, usize)> {
+    match codes {
+        [5, index, ..] => Some((Color::Indexed((*index).min(255) as u8), 2)),
+        [2, r, g, b, ..] => Some((
+            Color::Rgb((*r).min(255) as u8, (*g).min(255) as u8, (*b).min(255) as u8),
+            4,
+        )),
+        _ => None,
+    }
+}
+
+fn ansi_bg_color(code: u16) -> Option<Color> {
+    ansi_color(match code {
+        40..=47 => code - 10,
+        100..=107 => code - 10,
+        _ => return None,
+    })
+}
+
+fn ansi_color(code: u16) -> Option<Color> {
+    Some(match code {
+        30 => Color::Black,
+        31 => Color::Red,
+        32 => Color::Green,
+        33 => Color::Yellow,
+        34 => Color::Blue,
+        35 => Color::Magenta,
+        36 => Color::Cyan,
+        37 => Color::Gray,
+        90 => Color::DarkGray,
+        91 => Color::LightRed,
+        92 => Color::LightGreen,
+        93 => Color::LightYellow,
+        94 => Color::LightBlue,
+        95 => Color::LightMagenta,
+        96 => Color::LightCyan,
+        97 => Color::White,
+        _ => return None,
+    })
 }
 
 /// Filter log lines by `pattern` (a regex; falls back to case-insensitive
@@ -268,11 +374,11 @@ fn filter_log_lines(logs: &[String], pattern: &str) -> Vec<String> {
         return logs.to_vec();
     }
     match regex::RegexBuilder::new(pattern).case_insensitive(true).build() {
-        Ok(re) => logs.iter().filter(|l| re.is_match(l)).cloned().collect(),
+        Ok(re) => logs.iter().filter(|l| re.is_match(&plain_log_text(l))).cloned().collect(),
         Err(_) => {
             let needle = pattern.to_ascii_lowercase();
             logs.iter()
-                .filter(|l| l.to_ascii_lowercase().contains(&needle))
+                .filter(|l| plain_log_text(l).to_ascii_lowercase().contains(&needle))
                 .cloned()
                 .collect()
         }
@@ -624,9 +730,7 @@ async fn fetch_logs(client: &DaemonClient, instance: &str, resource: &str) -> Ve
         })
         .await
     {
-        // Sanitize on the way in so escape sequences and control bytes from
-        // the underlying process can never reach ratatui's buffer.
-        Ok(Response::Logs(l)) => l.iter().map(|line| sanitize(line)).collect(),
+        Ok(Response::Logs(l)) => l,
         _ => vec![],
     }
 }
@@ -640,7 +744,7 @@ fn log_lines(logs: &[String], h: usize, scroll: usize) -> Vec<Line<'static>> {
     let scroll = scroll.min(max_scroll);
     let end = logs.len() - scroll;
     let start = end.saturating_sub(h);
-    logs[start..end].iter().map(|l| Line::raw(l.clone())).collect()
+    logs[start..end].iter().map(|l| ansi_log_line(l)).collect()
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
@@ -950,38 +1054,61 @@ fn bold() -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_log_lines, hostname_from_url, parse_port, route_port_for_url, sanitize};
+    use super::{
+        ansi_log_line, filter_log_lines, hostname_from_url, parse_port, plain_log_text,
+        route_port_for_url,
+    };
     use crate::daemon::protocol::{DashboardState, RouteInfo};
+    use ratatui::style::{Color, Modifier};
 
     #[test]
-    fn sanitize_strips_escapes_and_control_but_keeps_emoji() {
-        // ANSI SGR color codes are removed, visible text kept.
-        assert_eq!(sanitize("\u{1b}[32mready\u{1b}[0m"), "ready");
+    fn plain_log_text_strips_controls_but_keeps_visible_text() {
+        // ANSI SGR color codes are removed for searching, visible text kept.
+        assert_eq!(plain_log_text("\u{1b}[32mready\u{1b}[0m"), "ready");
         // Cursor-move CSI sequences are removed.
-        assert_eq!(sanitize("a\u{1b}[2Kb"), "ab");
+        assert_eq!(plain_log_text("a\u{1b}[2Kb"), "ab");
         // OSC sequences (e.g. window title) terminated by BEL are removed.
-        assert_eq!(sanitize("\u{1b}]0;title\u{7}done"), "done");
+        assert_eq!(plain_log_text("\u{1b}]0;title\u{7}done"), "done");
         // Carriage returns and other control bytes are dropped; tabs expand.
-        assert_eq!(sanitize("a\rb\tc\u{0}"), "ab    c");
+        assert_eq!(plain_log_text("a\rb\tc\u{0}"), "ab    c");
         // Emoji and other printable Unicode survive intact.
-        assert_eq!(sanitize("\u{1b}[33m\u{2728} built \u{1f680}"), "\u{2728} built \u{1f680}");
+        assert_eq!(plain_log_text("\u{1b}[33m\u{2728} built \u{1f680}"), "\u{2728} built \u{1f680}");
         // A lone trailing ESC doesn't panic and is dropped.
-        assert_eq!(sanitize("hi\u{1b}"), "hi");
+        assert_eq!(plain_log_text("hi\u{1b}"), "hi");
+    }
+
+    #[test]
+    fn ansi_log_line_preserves_sgr_colors_as_spans() {
+        let line = ansi_log_line("\u{1b}[32mready\u{1b}[0m plain \u{1b}[1;31merr");
+
+        assert_eq!(line.spans[0].content.as_ref(), "ready");
+        assert_eq!(line.spans[0].style.fg, Some(Color::Green));
+        assert_eq!(line.spans[1].content.as_ref(), " plain ");
+        assert_eq!(line.spans[1].style.fg, None);
+        assert_eq!(line.spans[2].content.as_ref(), "err");
+        assert_eq!(line.spans[2].style.fg, Some(Color::Red));
+        assert!(line.spans[2].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
     fn log_filter_regex_substring_and_empty() {
         let logs = vec![
             "GET /healthz 200".to_string(),
-            "ERROR: connection refused".to_string(),
-            "GET /users 500".to_string(),
+            "\u{1b}[1mERROR\u{1b}[0m: connection refused".to_string(),
+            "\u{1b}[31mGET /users 500\u{1b}[0m".to_string(),
         ];
         // empty => all lines
         assert_eq!(filter_log_lines(&logs, "").len(), 3);
         // case-insensitive substring / regex
-        assert_eq!(filter_log_lines(&logs, "error"), vec!["ERROR: connection refused"]);
+        assert_eq!(
+            plain_log_text(&filter_log_lines(&logs, "error")[0]),
+            "ERROR: connection refused"
+        );
         // regex: lines with a 5xx status
-        assert_eq!(filter_log_lines(&logs, r"\b5\d\d\b"), vec!["GET /users 500"]);
+        assert_eq!(
+            plain_log_text(&filter_log_lines(&logs, r"\b5\d\d\b")[0]),
+            "GET /users 500"
+        );
         // invalid regex falls back to substring (no panic)
         assert_eq!(filter_log_lines(&logs, "GET [").len(), 0);
     }
