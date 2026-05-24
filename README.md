@@ -239,12 +239,19 @@ reverse proxy.
 - Each `local_resource` with a `serve_cmd` is assigned a free port (passed as
   `$PORT`/`$HOST` to the child) and registered as `<name>.<tld>`. Its UI link
   becomes e.g. `http://webserver.localhost:1360`.
+- Every `cmd` and `serve_cmd` receives service-discovery env vars for known
+  services: `STARLING_<RESOURCE>_URL`, `STARLING_<RESOURCE>_HOST`,
+  `STARLING_<RESOURCE>_PORT`, plus `STARLING_SERVICES_JSON`.
 - The Starling UI itself is mounted at `starling.<tld>`.
 - `alias(name, port)` (Starlingfile builtin) registers a static route to any
   already-running server — a Docker container, a k8s port-forward, etc.
 - `local_resource(..., serve_port=N)` prefers a fixed port; if that port is busy
   or already claimed by another route, Starling falls back to a free `$PORT` and
   logs a warning.
+- `starling_port(name, preferred=N)` leases a named host TCP port through the
+  same central allocator and returns a shell expansion for the matching
+  `STARLING_<NAME>_PORT` env var. Use this for non-HTTP services such as
+  Postgres that need port negotiation but cannot use the HTTP named-URL proxy.
 
 `.localhost` hostnames resolve to `127.0.0.1` automatically in browsers, so the
 URLs just work. Flags: `--proxy-port` (default `1360`), `--tld` (default

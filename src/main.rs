@@ -1316,6 +1316,7 @@ async fn up(args: UpArgs) {
                 args.dry_run,
                 config_path.clone(),
                 result.config_files,
+                result.port_leases,
                 restart_rx,
                 port_rx,
                 proxy_handle.clone(),

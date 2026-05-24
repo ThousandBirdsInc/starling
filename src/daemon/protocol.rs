@@ -120,6 +120,11 @@ pub enum Request {
         instance: String,
         preferred: Option<u16>,
     },
+    /// Release a previously leased host port that is no longer needed.
+    ReleasePort {
+        instance: String,
+        port: u16,
+    },
     RegisterRoute {
         instance: String,
         hostname: String,
@@ -166,8 +171,12 @@ pub enum Request {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Response {
     Ok,
-    Registered { instance: String },
-    Port { port: u16 },
+    Registered {
+        instance: String,
+    },
+    Port {
+        port: u16,
+    },
     ReservedPort {
         port: u16,
         preferred: Option<u16>,
@@ -176,6 +185,8 @@ pub enum Response {
     State(DashboardState),
     Logs(Vec<String>),
     Commands(Vec<Command>),
-    ShutdownQueued { instances: Vec<InstanceState> },
+    ShutdownQueued {
+        instances: Vec<InstanceState>,
+    },
     Error(String),
 }

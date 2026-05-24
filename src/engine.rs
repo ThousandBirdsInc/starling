@@ -18,12 +18,14 @@ use std::time::Duration;
 use chrono::Utc;
 use notify::{Event, RecursiveMode, Watcher};
 use regex::Regex;
+use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::api::v1alpha1::*;
-use crate::starlingfile::{self, Cmd, Manifest, TargetKind};
+use crate::proxy::PortReservation;
+use crate::starlingfile::{self, Cmd, Manifest, NamedPortLease, TargetKind};
 use crate::store::Store;
 
 pub struct Engine {
@@ -57,6 +59,12 @@ pub struct Engine {
     port_rx: mpsc::UnboundedReceiver<(String, u16)>,
     /// Session-scoped preferred port overrides from the dashboard.
     port_overrides: HashMap<String, u16>,
+    /// Named TCP port leases requested by the Starlingfile.
+    port_leases: Vec<NamedPortLease>,
+    /// Resolved named TCP port leases, keyed by Starlingfile name.
+    named_ports: HashMap<String, PortReservation>,
+    /// Runtime service references exposed to commands as STARLING_* env vars.
+    service_registry: Arc<Mutex<HashMap<String, ServiceEndpoint>>>,
     /// Named-URL proxy handle (daemon or local); `None` disables named URLs.
     proxy: Option<crate::proxy::ProxyHandle>,
 }
@@ -64,6 +72,16 @@ pub struct Engine {
 struct ServeTask {
     abort: tokio::task::AbortHandle,
     pid: Arc<Mutex<Option<u32>>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct ServiceEndpoint {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
 }
 
 impl Engine {
@@ -76,6 +94,7 @@ impl Engine {
         dry_run: bool,
         config_path: PathBuf,
         config_files: Vec<PathBuf>,
+        port_leases: Vec<NamedPortLease>,
         restart_rx: mpsc::UnboundedReceiver<String>,
         port_rx: mpsc::UnboundedReceiver<(String, u16)>,
         proxy: Option<crate::proxy::ProxyHandle>,
@@ -101,6 +120,9 @@ impl Engine {
             restart_rx,
             port_rx,
             port_overrides: HashMap::new(),
+            port_leases,
+            named_ports: HashMap::new(),
+            service_registry: Arc::new(Mutex::new(HashMap::new())),
             proxy,
         }
     }
@@ -129,6 +151,8 @@ impl Engine {
 
     /// Run the engine until the build channel closes.
     pub async fn run(mut self) {
+        self.reconcile_named_ports().await;
+        self.refresh_declared_services();
         self.materialize_all();
         self.start_watchers();
         for name in self.initial_build_order() {
@@ -236,7 +260,10 @@ impl Engine {
         }
 
         self.manifests = result.manifests;
+        self.port_leases = result.port_leases;
         self.apply_port_overrides();
+        self.reconcile_named_ports().await;
+        self.refresh_declared_services();
         self.config_files = result.config_files;
         self.reindex();
         let stopped_serves: Vec<String> = self
@@ -275,6 +302,96 @@ impl Engine {
                 m.serve_port = Some(*port);
             }
         }
+    }
+
+    async fn reconcile_named_ports(&mut self) {
+        let desired = desired_port_leases(&self.port_leases);
+        let removed: Vec<(String, PortReservation)> = self
+            .named_ports
+            .iter()
+            .filter(|(name, existing)| desired.get(*name) != Some(&existing.preferred))
+            .map(|(name, reservation)| (name.clone(), reservation.clone()))
+            .collect();
+        for (name, reservation) in removed {
+            if let Some(proxy) = &self.proxy {
+                proxy.release_port(reservation.port).await;
+            }
+            self.named_ports.remove(&name);
+            self.service_registry.lock().unwrap().remove(&name);
+        }
+
+        for (name, preferred) in desired {
+            if self.named_ports.contains_key(&name) {
+                continue;
+            }
+            let reservation = match &self.proxy {
+                Some(proxy) => proxy.reserve_port(preferred).await,
+                None => preferred.map(|port| PortReservation {
+                    port,
+                    preferred,
+                    conflict: false,
+                }),
+            };
+            let reservation = match reservation {
+                Some(reservation) => reservation,
+                None => match crate::proxy::find_free_port().await {
+                    Ok(port) => PortReservation {
+                        port,
+                        preferred,
+                        conflict: preferred.is_some(),
+                    },
+                    Err(err) => {
+                        self.store.append_log(
+                            Some(&self.config_span()),
+                            "ERROR",
+                            &format!("Could not allocate starling_port({name:?}): {err}\n"),
+                        );
+                        continue;
+                    }
+                },
+            };
+            if reservation.conflict {
+                if let Some(preferred) = reservation.preferred {
+                    self.store.append_log(
+                        Some(&self.config_span()),
+                        "WARN",
+                        &format!(
+                            "Configured starling_port({name:?}, preferred={preferred}) is unavailable; using fallback port {}\n",
+                            reservation.port
+                        ),
+                    );
+                }
+            }
+            self.named_ports.insert(name, reservation);
+        }
+    }
+
+    fn refresh_declared_services(&self) {
+        let mut registry = self.service_registry.lock().unwrap();
+        let mut keep = HashSet::new();
+        for m in &self.manifests {
+            if m.serve_cmd.is_empty() {
+                continue;
+            }
+            keep.insert(m.name.clone());
+            let entry = registry.entry(m.name.clone()).or_default();
+            if let Some(proxy) = &self.proxy {
+                entry.host = Some(proxy.hostname(&m.name));
+                entry.url = Some(proxy.url_for(&m.name));
+            }
+        }
+        for (name, reservation) in &self.named_ports {
+            keep.insert(name.clone());
+            registry.insert(
+                name.clone(),
+                ServiceEndpoint {
+                    host: Some("127.0.0.1".to_string()),
+                    port: Some(reservation.port),
+                    url: None,
+                },
+            );
+        }
+        registry.retain(|name, _| keep.contains(name));
     }
 
     /// Topologically order auto-init resources by `resource_deps`.
@@ -389,6 +506,7 @@ impl Engine {
         let store = self.store.clone();
         let name = m.name.clone();
         let proxy = self.proxy.clone();
+        let service_registry = self.service_registry.clone();
         let start_count = self.serve_start_counts.entry(name.clone()).or_insert(0);
         *start_count += 1;
         let restart_count = start_count.saturating_sub(1);
@@ -447,6 +565,14 @@ impl Engine {
                 let host = handle.hostname(&name);
                 handle.register(&name, p).await;
                 let url = handle.url_for(&name);
+                service_registry.lock().unwrap().insert(
+                    name.clone(),
+                    ServiceEndpoint {
+                        host: Some(host.clone()),
+                        port: Some(p),
+                        url: Some(url.clone()),
+                    },
+                );
                 m.serve_cmd
                     .env
                     .push(("PORTLESS_URL".to_string(), url.clone()));
@@ -467,6 +593,20 @@ impl Engine {
                     &format!("Serving on {url} (PORT={p})\n"),
                 );
             }
+            if proxy.is_none() {
+                if let Some(p) = port {
+                    service_registry.lock().unwrap().insert(
+                        name.clone(),
+                        ServiceEndpoint {
+                            host: Some("127.0.0.1".to_string()),
+                            port: Some(p),
+                            url: None,
+                        },
+                    );
+                }
+            }
+
+            m.serve_cmd = with_service_env(m.serve_cmd, &service_registry);
 
             store.append_log(
                 Some(&name),
@@ -591,6 +731,8 @@ impl Engine {
         if let Some(proxy) = &self.proxy {
             proxy.remove(name).await;
         }
+        self.service_registry.lock().unwrap().remove(name);
+        self.refresh_declared_services();
     }
 
     async fn replace_serve_after_update(&mut self, name: &str, m: Manifest) {
@@ -651,13 +793,15 @@ impl Engine {
                 span_id: Some(span.clone()),
             });
         });
+        let update_cmd = with_service_env(m.update_cmd.clone(), &self.service_registry);
+
         self.store.append_log(
             Some(name),
             "INFO",
-            &format!("Building: {}\n", m.update_cmd.display()),
+            &format!("Building: {}\n", update_cmd.display()),
         );
 
-        let result = run_to_completion(&m.update_cmd, &self.store, name).await;
+        let result = run_to_completion(&update_cmd, &self.store, name).await;
         let finish = Utc::now().to_rfc3339();
         let error = match result {
             Ok(true) => None,
@@ -1509,6 +1653,70 @@ async fn run_to_completion(cmd: &Cmd, store: &Arc<Store>, span: &str) -> Result<
     Ok(status.success())
 }
 
+fn desired_port_leases(port_leases: &[NamedPortLease]) -> HashMap<String, Option<u16>> {
+    let mut desired = HashMap::new();
+    for lease in port_leases {
+        desired.insert(lease.name.clone(), lease.preferred);
+    }
+    desired
+}
+
+fn with_service_env(mut cmd: Cmd, registry: &Arc<Mutex<HashMap<String, ServiceEndpoint>>>) -> Cmd {
+    let mut env = service_env(registry);
+    env.extend(cmd.env);
+    cmd.env = env;
+    cmd
+}
+
+fn service_env(registry: &Arc<Mutex<HashMap<String, ServiceEndpoint>>>) -> Vec<(String, String)> {
+    let services = registry.lock().unwrap().clone();
+    let mut env = vec![];
+    let mut service_json = serde_json::Map::new();
+    for (name, endpoint) in services {
+        let key = service_env_key(&name);
+        if let Some(host) = &endpoint.host {
+            env.push((format!("STARLING_{key}_HOST"), host.clone()));
+        }
+        if let Some(port) = endpoint.port {
+            env.push((format!("STARLING_{key}_PORT"), port.to_string()));
+        }
+        if let Some(url) = &endpoint.url {
+            env.push((format!("STARLING_{key}_URL"), url.clone()));
+        }
+        service_json.insert(
+            name,
+            serde_json::to_value(endpoint).unwrap_or_else(|_| serde_json::Value::Null),
+        );
+    }
+    env.push((
+        "STARLING_SERVICES_JSON".to_string(),
+        serde_json::Value::Object(service_json).to_string(),
+    ));
+    env
+}
+
+fn service_env_key(name: &str) -> String {
+    let mut out = String::new();
+    let mut previous_sep = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_uppercase());
+            previous_sep = false;
+        } else if !previous_sep && !out.is_empty() {
+            out.push('_');
+            previous_sep = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "SERVICE".to_string()
+    } else {
+        out
+    }
+}
+
 /// Forward each line of an async reader into the log store under `span`.
 fn stream_lines<R>(
     reader: R,
@@ -1756,5 +1964,36 @@ mod tests {
 
         assert!(!rewrite_serve_cmd_port_args(&mut cmd, 54756));
         assert_eq!(cmd.argv[2], "vite --host 127.0.0.1 --port $PORT");
+    }
+
+    #[test]
+    fn service_env_uses_stable_resource_keys() {
+        let registry = Arc::new(Mutex::new(HashMap::from([(
+            "control-plane-api".to_string(),
+            ServiceEndpoint {
+                host: Some("control-plane-api-paas.localhost".to_string()),
+                port: Some(54756),
+                url: Some("http://control-plane-api-paas.localhost:1360".to_string()),
+            },
+        )])));
+
+        let env = service_env(&registry);
+
+        assert!(env.contains(&(
+            "STARLING_CONTROL_PLANE_API_HOST".to_string(),
+            "control-plane-api-paas.localhost".to_string()
+        )));
+        assert!(env.contains(&(
+            "STARLING_CONTROL_PLANE_API_PORT".to_string(),
+            "54756".to_string()
+        )));
+        assert!(env.contains(&(
+            "STARLING_CONTROL_PLANE_API_URL".to_string(),
+            "http://control-plane-api-paas.localhost:1360".to_string()
+        )));
+        assert!(env
+            .iter()
+            .any(|(key, value)| key == "STARLING_SERVICES_JSON"
+                && value.contains("control-plane-api")));
     }
 }

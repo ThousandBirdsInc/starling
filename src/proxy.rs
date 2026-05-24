@@ -195,6 +195,27 @@ impl ProxyHandle {
         }
     }
 
+    /// Release a host port leased with [`ProxyHandle::reserve_port`].
+    pub async fn release_port(&self, port: u16) {
+        match self {
+            ProxyHandle::Local(c) => {
+                let mut leased = c.leased_ports.lock().await;
+                leased.remove(&port);
+            }
+            ProxyHandle::Daemon {
+                client, instance, ..
+            } => {
+                use crate::daemon::protocol::Request;
+                let _ = client
+                    .call(&Request::ReleasePort {
+                        instance: instance.clone(),
+                        port,
+                    })
+                    .await;
+            }
+        }
+    }
+
     /// Register a route for `label` → `port`.
     pub async fn register(&self, label: &str, port: u16) {
         let host = self.hostname(label);

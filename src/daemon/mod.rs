@@ -235,6 +235,19 @@ impl Daemon {
                 None => Response::Error("could not allocate a free port".into()),
             },
 
+            Request::ReleasePort { instance, port } => {
+                let mut inner = self.inner.lock().await;
+                if inner
+                    .leased_ports
+                    .get(&port)
+                    .map(|owner| owner == &instance)
+                    .unwrap_or(false)
+                {
+                    inner.leased_ports.remove(&port);
+                }
+                Response::Ok
+            }
+
             Request::RegisterRoute {
                 instance,
                 hostname,
@@ -283,11 +296,7 @@ impl Daemon {
             Request::GetState => {
                 let mut inner = self.inner.lock().await;
                 self.prune(&mut inner);
-                let instances = inner
-                    .instances
-                    .values()
-                    .map(|i| i.state.clone())
-                    .collect();
+                let instances = inner.instances.values().map(|i| i.state.clone()).collect();
                 Response::State(DashboardState {
                     instances,
                     routes: inner.routes.clone(),
@@ -557,6 +566,24 @@ mod tests {
             daemon.handle(Request::RemoveRoute { hostname }).await,
             Response::Ok
         ));
+        assert!(!daemon.inner.lock().await.leased_ports.contains_key(&port));
+    }
+
+    #[tokio::test]
+    async fn release_port_releases_matching_instance_lease() {
+        let daemon = test_daemon();
+        let port = daemon.reserve_port("inst", None).await.unwrap().port;
+
+        assert!(matches!(
+            daemon
+                .handle(Request::ReleasePort {
+                    instance: "inst".to_string(),
+                    port,
+                })
+                .await,
+            Response::Ok
+        ));
+
         assert!(!daemon.inner.lock().await.leased_ports.contains_key(&port));
     }
 }

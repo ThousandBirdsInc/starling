@@ -21,7 +21,7 @@ use starlark::values::list::ListRef;
 use starlark::values::none::NoneType;
 use starlark::values::Value;
 
-pub use manifest::{Cmd, DockerBuild, LiveUpdateStep, Manifest, TargetKind};
+pub use manifest::{Cmd, DockerBuild, LiveUpdateStep, Manifest, NamedPortLease, TargetKind};
 
 /// Separator for encoding live_update steps as strings returned by sync()/run().
 const LU_SEP: char = '\u{1}';
@@ -32,11 +32,39 @@ fn parse_build_args(v: Value) -> Vec<(String, String)> {
     let mut out = vec![];
     if let Some(d) = DictRef::from_value(v) {
         for (k, val) in d.iter() {
-            let key = k.unpack_str().map(str::to_string).unwrap_or_else(|| k.to_str());
-            let value = val.unpack_str().map(str::to_string).unwrap_or_else(|| val.to_str());
+            let key = k
+                .unpack_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| k.to_str());
+            let value = val
+                .unpack_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| val.to_str());
             out.push((key, value));
         }
     }
+    out
+}
+
+fn service_port_env_name(name: &str) -> String {
+    let mut out = String::from("STARLING_");
+    let mut previous_sep = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_uppercase());
+            previous_sep = false;
+        } else if !previous_sep {
+            out.push('_');
+            previous_sep = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out == "STARLING" {
+        out.push_str("_SERVICE");
+    }
+    out.push_str("_PORT");
     out
 }
 
@@ -51,7 +79,9 @@ fn parse_live_update(v: Value, dir: &Path) -> Vec<LiveUpdateStep> {
                     local: resolve(dir, local).display().to_string(),
                     remote: remote.to_string(),
                 }),
-                ["run", cmd] => Some(LiveUpdateStep::Run { cmd: cmd.to_string() }),
+                ["run", cmd] => Some(LiveUpdateStep::Run {
+                    cmd: cmd.to_string(),
+                }),
                 ["restart"] => Some(LiveUpdateStep::RestartContainer),
                 ["initialsync"] => Some(LiveUpdateStep::InitialSync),
                 [first, rest @ ..] if *first == "fallback" => Some(LiveUpdateStep::FallBackOn(
@@ -76,6 +106,8 @@ pub struct LoadResult {
     pub manifests: Vec<Manifest>,
     /// Static proxy routes from `alias(name, port)`.
     pub aliases: Vec<(String, u16)>,
+    /// Named TCP ports requested with `starling_port(...)`.
+    pub port_leases: Vec<NamedPortLease>,
     /// Captured Starlingfile-execution log output (from `print`, `local`, notes).
     pub log: String,
     /// Directory containing the Starlingfile (base for relative paths).
@@ -188,6 +220,8 @@ struct TfState {
     k8s_configs: RefCell<Vec<K8sResourceConfig>>,
     /// Static proxy routes registered via `alias(name, port)`.
     aliases: RefCell<Vec<(String, u16)>>,
+    /// Named host TCP ports requested via `starling_port(...)`.
+    port_leases: RefCell<Vec<NamedPortLease>>,
     log: RefCell<String>,
 }
 
@@ -229,7 +263,11 @@ fn as_str_vec(v: Value) -> Vec<String> {
     if let Some(list) = ListRef::from_value(v) {
         return list
             .iter()
-            .map(|e| e.unpack_str().map(str::to_string).unwrap_or_else(|| e.to_str()))
+            .map(|e| {
+                e.unpack_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| e.to_str())
+            })
             .collect();
     }
     vec![]
@@ -254,15 +292,20 @@ fn as_cmd(v: Value, workdir: &Path) -> Cmd {
 
 /// Strip a tag/digest from a container image reference, returning the repo.
 fn image_repo(image: &str) -> &str {
-    image.split('@').next().unwrap_or(image).rsplit_once(':').map_or(image, |(repo, tag)| {
-        // A ':' in the registry host:port isn't a tag; only treat the final
-        // path segment's ':' as a tag.
-        if tag.contains('/') {
-            image
-        } else {
-            repo
-        }
-    })
+    image
+        .split('@')
+        .next()
+        .unwrap_or(image)
+        .rsplit_once(':')
+        .map_or(image, |(repo, tag)| {
+            // A ':' in the registry host:port isn't a tag; only treat the final
+            // path segment's ':' as a tag.
+            if tag.contains('/') {
+                image
+            } else {
+                repo
+            }
+        })
 }
 
 /// True if a container image refers to the given docker_build ref.
@@ -378,7 +421,13 @@ fn starling_builtins(builder: &mut GlobalsBuilder) {
         #[starlark(require = named, default = NoneType)] serve_port: Value<'v>,
         eval: &mut Evaluator,
     ) -> anyhow::Result<NoneType> {
-        let _ = (allow_parallel, ignore, cmd_bat, serve_cmd_bat, readiness_probe);
+        let _ = (
+            allow_parallel,
+            ignore,
+            cmd_bat,
+            serve_cmd_bat,
+            readiness_probe,
+        );
         let st = state(eval);
         let base = st.cur_dir();
         let mut m = Manifest::new(name, TargetKind::Local);
@@ -389,7 +438,10 @@ fn starling_builtins(builder: &mut GlobalsBuilder) {
                 m.serve_port = Some(p as u16);
             }
         }
-        let cmd_workdir = dir.unpack_str().map(|d| resolve(&base, d)).unwrap_or_else(|| base.clone());
+        let cmd_workdir = dir
+            .unpack_str()
+            .map(|d| resolve(&base, d))
+            .unwrap_or_else(|| base.clone());
         let serve_workdir = serve_dir
             .unpack_str()
             .map(|d| resolve(&base, d))
@@ -403,7 +455,10 @@ fn starling_builtins(builder: &mut GlobalsBuilder) {
             m.serve_cmd.env = parse_build_args(serve_env);
         }
         if !deps.is_none() {
-            m.deps = as_str_vec(deps).into_iter().map(|d| resolve(&base, &d)).collect();
+            m.deps = as_str_vec(deps)
+                .into_iter()
+                .map(|d| resolve(&base, &d))
+                .collect();
         }
         if !resource_deps.is_none() {
             m.resource_deps = as_str_vec(resource_deps);
@@ -490,7 +545,10 @@ fn starling_builtins(builder: &mut GlobalsBuilder) {
         let p = resolve(&dir, &paths);
         st.config_files.borrow_mut().push(p.clone());
         let extra = as_str_vec(flags);
-        let bin = kustomize_bin.unpack_str().unwrap_or("kustomize").to_string();
+        let bin = kustomize_bin
+            .unpack_str()
+            .unwrap_or("kustomize")
+            .to_string();
         let mut argv = vec![bin, "build".to_string(), p.display().to_string()];
         argv.extend(extra.clone());
         match run_capture(&argv, &dir) {
@@ -573,9 +631,10 @@ fn starling_builtins(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_>,
     ) -> anyhow::Result<starlark::values::Value<'v>> {
         run_starlingfile_into(&path, eval)?;
-        Ok(eval.heap().alloc(starlark::values::dict::AllocDict(
-            Vec::<(starlark::values::Value, starlark::values::Value)>::new(),
-        )))
+        Ok(eval.heap().alloc(starlark::values::dict::AllocDict(Vec::<(
+            starlark::values::Value,
+            starlark::values::Value,
+        )>::new())))
     }
 
     /// Evaluate another Starlingfile for its side effects (resource
@@ -599,9 +658,16 @@ fn starling_builtins(builder: &mut GlobalsBuilder) {
         let want_labels = parse_build_args(labels);
         let (mut matching, mut rest) = (Vec::new(), Vec::new());
         for e in k8s::parse_yaml(&content) {
-            let ok = kind.unpack_str().map_or(true, |k| e.kind.eq_ignore_ascii_case(k))
+            let ok = kind
+                .unpack_str()
+                .map_or(true, |k| e.kind.eq_ignore_ascii_case(k))
                 && name.unpack_str().map_or(true, |n| e.name == n)
-                && doc_matches(&e.raw, namespace.unpack_str(), api_version.unpack_str(), &want_labels);
+                && doc_matches(
+                    &e.raw,
+                    namespace.unpack_str(),
+                    api_version.unpack_str(),
+                    &want_labels,
+                );
             if ok {
                 matching.push(e.raw);
             } else {
@@ -714,10 +780,16 @@ fn starling_builtins(builder: &mut GlobalsBuilder) {
         let _ = (tag, disable_push, skips_local_docker);
         let st = state(eval);
         let base = st.cur_dir();
-        let workdir = dir.unpack_str().map(|d| resolve(&base, d)).unwrap_or_else(|| base.clone());
+        let workdir = dir
+            .unpack_str()
+            .map(|d| resolve(&base, d))
+            .unwrap_or_else(|| base.clone());
         let mut cmd = as_cmd(command, &workdir);
         cmd.env = parse_build_args(env);
-        let dep_paths = as_str_vec(deps).into_iter().map(|d| resolve(&base, &d)).collect();
+        let dep_paths = as_str_vec(deps)
+            .into_iter()
+            .map(|d| resolve(&base, &d))
+            .collect();
         let lu = if live_update.is_none() {
             vec![]
         } else {
@@ -884,6 +956,36 @@ fn starling_builtins(builder: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
+    /// Request a centrally leased host TCP port and return a shell expansion
+    /// for the env var Starling injects at command runtime.
+    fn starling_port<'v>(
+        name: String,
+        #[starlark(require = named, default = NoneType)] preferred: Value<'v>,
+        eval: &mut Evaluator,
+    ) -> anyhow::Result<String> {
+        let preferred = if preferred.is_none() {
+            None
+        } else {
+            let Some(port) = preferred.unpack_i32() else {
+                return Err(anyhow!(
+                    "starling_port({name:?}): preferred must be an integer"
+                ));
+            };
+            if port <= 0 || port >= 65536 {
+                return Err(anyhow!(
+                    "starling_port({name:?}): preferred port out of range"
+                ));
+            }
+            Some(port as u16)
+        };
+        let st = state(eval);
+        st.port_leases.borrow_mut().push(NamedPortLease {
+            name: name.clone(),
+            preferred,
+        });
+        Ok(format!("${{{}}}", service_port_env_name(&name)))
+    }
+
     /// Accepted no-ops (config that doesn't affect local execution yet).
     fn default_registry<'v>(
         _host: String,
@@ -919,7 +1021,11 @@ fn doc_matches(
         return false;
     };
     if let Some(ns) = namespace {
-        if v.get("metadata").and_then(|m| m.get("namespace")).and_then(|x| x.as_str()) != Some(ns) {
+        if v.get("metadata")
+            .and_then(|m| m.get("namespace"))
+            .and_then(|x| x.as_str())
+            != Some(ns)
+        {
             return false;
         }
     }
@@ -957,7 +1063,10 @@ fn run_starlingfile_into(path: &str, eval: &mut Evaluator) -> Result<()> {
     let globals = build_globals();
     let module = Module::new();
     let printer = LogPrint(&st.log);
-    let loader = StarlingLoader { st, globals: &globals };
+    let loader = StarlingLoader {
+        st,
+        globals: &globals,
+    };
     st.dir_stack.borrow_mut().push(parent_or_dot(&target));
     let result = {
         let mut sub = Evaluator::new(&module);
@@ -1012,7 +1121,9 @@ fn assemble_k8s(st: &TfState) -> Vec<Manifest> {
         // Match docker builds to this workload's images.
         for img in &e.images {
             for db in docker_builds.iter() {
-                if image_matches(img, &db.image_ref) && !m.docker_builds.iter().any(|d| d.image_ref == db.image_ref) {
+                if image_matches(img, &db.image_ref)
+                    && !m.docker_builds.iter().any(|d| d.image_ref == db.image_ref)
+                {
                     // Inherit live_update + watch its sync sources for changes.
                     for step in &db.live_update {
                         if let LiveUpdateStep::Sync { local, .. } = step {
@@ -1067,7 +1178,10 @@ fn assemble_k8s(st: &TfState) -> Vec<Manifest> {
             // Attach explicitly-grouped bare objects' docs to this resource.
             for obj in &cfg.objects {
                 let obj_name = obj.split(':').next().unwrap_or(obj);
-                if let Some(e) = entities.iter().find(|e| !e.is_workload() && e.name == obj_name) {
+                if let Some(e) = entities
+                    .iter()
+                    .find(|e| !e.is_workload() && e.name == obj_name)
+                {
                     m.k8s_apply_docs.push(e.raw.clone());
                 }
             }
@@ -1098,10 +1212,8 @@ mod tests {
 
     #[test]
     fn tilt_compat_os_environ_and_readiness_probe() {
-        let dir = std::env::temp_dir().join(format!(
-            "starling-tilt-compat-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("starling-tilt-compat-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("Tiltfile");
         fs::write(
@@ -1120,6 +1232,32 @@ local_resource(
         let result = load(&file).unwrap();
         assert_eq!(result.manifests.len(), 1);
         assert_eq!(result.manifests[0].name, "web");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn starling_port_records_named_port_and_returns_env_reference() {
+        let dir = std::env::temp_dir().join(format!("starling-port-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Starlingfile");
+        fs::write(
+            &file,
+            r#"
+pg_port = starling_port("control-plane-postgres", preferred=54330)
+local_resource("api", serve_cmd="echo ${STARLING_CONTROL_PLANE_POSTGRES_PORT} " + pg_port)
+"#,
+        )
+        .unwrap();
+
+        let result = load(&file).unwrap();
+        assert_eq!(result.port_leases.len(), 1);
+        assert_eq!(result.port_leases[0].name, "control-plane-postgres");
+        assert_eq!(result.port_leases[0].preferred, Some(54330));
+        assert_eq!(
+            result.manifests[0].serve_cmd.argv[2],
+            "echo ${STARLING_CONTROL_PLANE_POSTGRES_PORT} ${STARLING_CONTROL_PLANE_POSTGRES_PORT}"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -1146,7 +1284,10 @@ pub fn load(path: &Path) -> Result<LoadResult> {
     st.config_files.borrow_mut().push(path.to_path_buf());
 
     let printer = LogPrint(&st.log);
-    let loader = StarlingLoader { st: &st, globals: &globals };
+    let loader = StarlingLoader {
+        st: &st,
+        globals: &globals,
+    };
 
     {
         let mut eval = Evaluator::new(&module);
@@ -1162,6 +1303,7 @@ pub fn load(path: &Path) -> Result<LoadResult> {
     manifests.extend(assemble_k8s(&st));
 
     let aliases = st.aliases.borrow().clone();
+    let port_leases = st.port_leases.borrow().clone();
     let log = st.log.borrow().clone();
     let mut config_files = st.config_files.borrow().clone();
     config_files.sort();
@@ -1169,6 +1311,7 @@ pub fn load(path: &Path) -> Result<LoadResult> {
     Ok(LoadResult {
         manifests,
         aliases,
+        port_leases,
         log,
         config_dir: dir,
         config_files,

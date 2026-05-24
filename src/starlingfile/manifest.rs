@@ -126,6 +126,17 @@ pub struct Manifest {
     pub live_update: Vec<LiveUpdateStep>,
 }
 
+/// A named host TCP port requested by the Starlingfile.
+///
+/// These are not HTTP proxy routes. They are centrally leased ports for
+/// services such as databases where other resources need a stable
+/// `STARLING_<NAME>_PORT` value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedPortLease {
+    pub name: String,
+    pub preferred: Option<u16>,
+}
+
 impl Manifest {
     /// Whether file changes auto-trigger a build (Auto / AutoWithManualInit).
     /// Manual modes (ManualWithAutoInit / Manual) only mark pending changes.
