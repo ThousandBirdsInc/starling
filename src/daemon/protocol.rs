@@ -42,6 +42,8 @@ pub struct ResourceSnapshot {
     pub proxy_message: Option<String>,
     pub build_count: u32,
     pub last_deploy: Option<String>,
+    pub restart_count: Option<u32>,
+    pub last_start: Option<String>,
 }
 
 /// Everything the daemon knows about one connected instance.

@@ -373,6 +373,7 @@ fn snapshot(r: &api::v1alpha1::UIResource) -> ResourceSnapshot {
         .conditions
         .iter()
         .find(|c| c.condition_type == "ProxyReachable");
+    let local = st.local_resource_info.as_ref();
     ResourceSnapshot {
         name,
         kind,
@@ -384,6 +385,10 @@ fn snapshot(r: &api::v1alpha1::UIResource) -> ResourceSnapshot {
         proxy_message: proxy_condition.and_then(|c| c.message.clone()),
         build_count: st.build_history.len() as u32,
         last_deploy: st.last_deploy_time,
+        restart_count: local
+            .and_then(|l| l.restart_count)
+            .and_then(|count| u32::try_from(count).ok()),
+        last_start: local.and_then(|l| l.last_start_time.clone()),
     }
 }
 

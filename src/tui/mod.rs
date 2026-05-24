@@ -17,6 +17,7 @@
 use std::io;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Local};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -105,6 +106,8 @@ struct RowItem {
     pod: String,
     url: String,
     route_port: Option<u16>,
+    restart_count: Option<u32>,
+    last_start: Option<String>,
 }
 
 #[derive(PartialEq)]
@@ -561,6 +564,8 @@ fn filtered(state: &DashboardState, filter: &str) -> Vec<RowItem> {
                 pod: r.pod.clone().unwrap_or_default(),
                 url: r.url.clone().unwrap_or_default(),
                 route_port: route_port_for_url(state, &inst.id, r.url.as_deref()),
+                restart_count: r.restart_count,
+                last_start: r.last_start.clone(),
             };
             if f.is_empty()
                 || item.name.to_ascii_lowercase().contains(&f)
@@ -589,6 +594,21 @@ fn hostname_from_url(url: &str) -> Option<String> {
         return None;
     }
     Some(authority.split(':').next().unwrap_or(authority).to_string())
+}
+
+fn format_start_time(timestamp: Option<&str>, full: bool) -> String {
+    let Some(timestamp) = timestamp else {
+        return String::new();
+    };
+    let Ok(parsed) = DateTime::parse_from_rfc3339(timestamp) else {
+        return timestamp.to_string();
+    };
+    let local = parsed.with_timezone(&Local);
+    if full {
+        local.format("%Y-%m-%d %H:%M:%S").to_string()
+    } else {
+        local.format("%H:%M:%S").to_string()
+    }
 }
 
 fn parse_port(input: &str) -> Option<u16> {
@@ -647,7 +667,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     let frame = app.spinner_frame();
     let header = Row::new(
-        ["INSTANCE", "RESOURCE", "TYPE", "UPDATE", "RUNTIME", "PORT", "POD", "URL"]
+        ["INSTANCE", "RESOURCE", "TYPE", "UPDATE", "RUNTIME", "RESTARTS", "LAST START", "PORT", "POD", "URL"]
             .iter()
             .map(|h| {
                 Cell::from(*h).style(
@@ -672,6 +692,8 @@ fn draw(f: &mut Frame, app: &mut App) {
                 Cell::from(r.kind.clone()),
                 Cell::from(status_cell(&r.update, frame)),
                 Cell::from(status_cell(&r.runtime, frame)),
+                Cell::from(r.restart_count.map(|count| count.to_string()).unwrap_or_default()),
+                Cell::from(format_start_time(r.last_start.as_deref(), false)),
                 Cell::from(r.route_port.map(|p| p.to_string()).unwrap_or_default()),
                 Cell::from(r.pod.clone()),
                 Cell::from(Span::styled(r.url.clone(), Style::default().fg(theme::URL))),
@@ -684,9 +706,11 @@ fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Length(6),
         Constraint::Length(13),
         Constraint::Length(13),
+        Constraint::Length(8),
+        Constraint::Length(10),
         Constraint::Length(7),
-        Constraint::Length(20),
-        Constraint::Min(20),
+        Constraint::Length(16),
+        Constraint::Min(18),
     ];
     let table = Table::new(table_rows, widths)
         .header(header)
@@ -832,6 +856,8 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
         pod: String::new(),
         url: String::new(),
         route_port: None,
+        restart_count: None,
+        last_start: None,
     });
 
     let frame = app.spinner_frame();
@@ -868,6 +894,14 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
             v.extend(status_cell(&r.runtime, frame).spans);
             v
         }),
+        Line::from(vec![
+            field("restarts "),
+            Span::raw(r.restart_count.map(|count| count.to_string()).unwrap_or_default()),
+        ]),
+        Line::from(vec![
+            field("started  "),
+            Span::raw(format_start_time(r.last_start.as_deref(), true)),
+        ]),
         Line::from(vec![field("port      "), Span::raw(r.route_port.map(|p| p.to_string()).unwrap_or_default())]),
         Line::from(vec![field("pod       "), Span::raw(r.pod.clone())]),
         Line::from(vec![field("url       "), Span::styled(r.url.clone(), Style::default().fg(theme::URL).add_modifier(Modifier::UNDERLINED))]),

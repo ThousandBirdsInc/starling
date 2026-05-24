@@ -44,6 +44,8 @@ pub struct Engine {
     config_files: Vec<PathBuf>,
     /// Resources whose `serve_cmd` is already running (avoid duplicates on reload).
     started_serves: HashSet<String>,
+    /// Number of times each serve_cmd has started during this engine session.
+    serve_start_counts: HashMap<String, u32>,
     /// Abort handles for running serve_cmd tasks (used to restart/kill).
     serve_tasks: HashMap<String, ServeTask>,
     /// Incremented on config reload so stale file watcher threads stop
@@ -93,6 +95,7 @@ impl Engine {
             config_path,
             config_files,
             started_serves: HashSet::new(),
+            serve_start_counts: HashMap::new(),
             serve_tasks: HashMap::new(),
             watcher_generation: Arc::new(AtomicU64::new(0)),
             restart_rx,
@@ -226,6 +229,7 @@ impl Engine {
             .collect();
         for name in removed {
             self.port_overrides.remove(&name);
+            self.serve_start_counts.remove(&name);
             self.stop_serve(&name, "Stopping serve_cmd; resource was removed...\n")
                 .await;
             self.store.remove_resource(&name);
@@ -385,6 +389,10 @@ impl Engine {
         let store = self.store.clone();
         let name = m.name.clone();
         let proxy = self.proxy.clone();
+        let start_count = self.serve_start_counts.entry(name.clone()).or_insert(0);
+        *start_count += 1;
+        let restart_count = start_count.saturating_sub(1);
+        let last_start_time = Utc::now().to_rfc3339();
         let pid_slot = Arc::new(Mutex::new(None));
         let task_pid = pid_slot.clone();
         let task = tokio::spawn(async move {
@@ -467,6 +475,9 @@ impl Engine {
             );
             store.update_status(&name, |st| {
                 st.runtime_status = Some("pending".to_string());
+                let local = st.local_resource_info.get_or_insert_with(Default::default);
+                local.restart_count = Some(restart_count as i32);
+                local.last_start_time = Some(last_start_time.clone());
             });
             let route_monitor = match (&proxy, port) {
                 (Some(handle), Some(p)) => Some(ServeRouteMonitor::new(
@@ -486,12 +497,11 @@ impl Engine {
                     *task_pid.lock().unwrap() = pid;
                     store.update_status(&name, |st| {
                         st.runtime_status = Some("ok".to_string());
-                        if let Some(pid) = pid {
-                            st.local_resource_info = Some(UIResourceLocal {
-                                pid: Some(pid as i64),
-                                is_test: Some(false),
-                            });
-                        }
+                        let local = st.local_resource_info.get_or_insert_with(Default::default);
+                        local.pid = pid.map(|pid| pid as i64);
+                        local.is_test = Some(false);
+                        local.restart_count = Some(restart_count as i32);
+                        local.last_start_time = Some(last_start_time.clone());
                     });
                     let health_task = route_monitor
                         .as_ref()
@@ -1229,6 +1239,8 @@ fn initial_resource(m: &Manifest, order: i32) -> UIResource {
         st.local_resource_info = Some(UIResourceLocal {
             pid: Some(0),
             is_test: Some(false),
+            restart_count: None,
+            last_start_time: None,
         });
     }
     UIResource {
