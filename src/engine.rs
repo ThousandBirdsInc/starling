@@ -680,6 +680,13 @@ impl Engine {
     /// Restart a resource's serve_cmd: kill the running process and start it
     /// again (gets a fresh port + route).
     async fn restart(&mut self, name: &str) {
+        // Reflect the restart immediately. stop_serve aborts the running task
+        // without touching runtime_status, and spawn_serve only sets "pending"
+        // after async port/route setup — so without this the dashboard keeps
+        // showing a stale "ok" through the whole kill-and-respawn window.
+        self.store.update_status(name, |st| {
+            st.runtime_status = Some("in_progress".to_string());
+        });
         self.stop_serve(name, "Restarting serve_cmd...\n").await;
         // Respawn just this resource's serve.
         if let Some(&i) = self.by_name.get(name) {
@@ -739,11 +746,19 @@ impl Engine {
         if m.serve_cmd.is_empty() {
             return;
         }
-        let message = if self.started_serves.contains(name) {
+        let restarting = self.started_serves.contains(name);
+        let message = if restarting {
             "Restarting serve_cmd after successful update...\n"
         } else {
             "Starting serve_cmd after successful update...\n"
         };
+        // An already-running serve is being killed and respawned: show the
+        // restart right away instead of leaving a stale "ok" (see restart()).
+        if restarting {
+            self.store.update_status(name, |st| {
+                st.runtime_status = Some("in_progress".to_string());
+            });
+        }
         self.stop_serve(name, message).await;
         self.started_serves.insert(name.to_string());
         self.spawn_serve(m);

@@ -67,22 +67,34 @@ fn status_symbol(s: &str, frame: usize) -> (&'static str, Style) {
     }
 }
 
-/// Human-friendly label for a raw status string.
-fn pretty_status(s: &str) -> String {
+/// Which status column a value belongs to. The same raw string reads
+/// differently in each: an `in_progress` *update* is a build, while an
+/// `in_progress` *runtime* is a serve_cmd being (re)started.
+#[derive(Clone, Copy, PartialEq)]
+enum StatusKind {
+    Update,
+    Runtime,
+}
+
+/// Human-friendly label for a raw status string, in the context of its column.
+fn pretty_status(s: &str, kind: StatusKind) -> String {
     match s {
         "not_applicable" | "none" | "" => "—".into(),
-        "in_progress" => "building".into(),
+        "in_progress" => match kind {
+            StatusKind::Update => "building".into(),
+            StatusKind::Runtime => "restarting".into(),
+        },
         other => other.replace('_', " "),
     }
 }
 
 /// A status cell: colored symbol followed by its prettified label.
-fn status_cell(s: &str, frame: usize) -> Line<'static> {
+fn status_cell(s: &str, frame: usize, kind: StatusKind) -> Line<'static> {
     let (sym, style) = status_symbol(s, frame);
     Line::from(vec![
         Span::styled(sym, style),
         Span::raw(" "),
-        Span::styled(pretty_status(s), style),
+        Span::styled(pretty_status(s, kind), style),
     ])
 }
 
@@ -977,8 +989,8 @@ fn draw(f: &mut Frame, app: &mut App) {
                     Style::default().add_modifier(Modifier::BOLD),
                 )),
                 Cell::from(r.kind.clone()),
-                Cell::from(status_cell(&r.update, frame)),
-                Cell::from(status_cell(&r.runtime, frame)),
+                Cell::from(status_cell(&r.update, frame, StatusKind::Update)),
+                Cell::from(status_cell(&r.runtime, frame, StatusKind::Runtime)),
                 Cell::from(r.restart_count.map(|count| count.to_string()).unwrap_or_default()),
                 Cell::from(format_start_time(r.last_start.as_deref(), false)),
                 Cell::from(r.route_port.map(|p| p.to_string()).unwrap_or_default()),
@@ -1180,12 +1192,12 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
         Line::from(vec![field("type      "), Span::raw(r.kind.clone())]),
         Line::from({
             let mut v = vec![field("update    ")];
-            v.extend(status_cell(&r.update, frame).spans);
+            v.extend(status_cell(&r.update, frame, StatusKind::Update).spans);
             v
         }),
         Line::from({
             let mut v = vec![field("runtime   ")];
-            v.extend(status_cell(&r.runtime, frame).spans);
+            v.extend(status_cell(&r.runtime, frame, StatusKind::Runtime).spans);
             v
         }),
         Line::from(vec![
@@ -1250,7 +1262,7 @@ fn bold() -> Style {
 mod tests {
     use super::{
         ansi_log_line, clamp_scroll, filter_log_lines, hostname_from_url, parse_port,
-        plain_log_text, route_port_for_url, visible_window,
+        plain_log_text, pretty_status, route_port_for_url, visible_window, StatusKind,
     };
     use crate::daemon::protocol::{DashboardState, RouteInfo};
     use ratatui::style::{Color, Modifier};
@@ -1335,6 +1347,18 @@ mod tests {
         assert_eq!(clamp_scroll(5, -9, 100), 0);
         // When everything fits (max 0), scrolling is a no-op.
         assert_eq!(clamp_scroll(0, 9, 0), 0);
+    }
+
+    #[test]
+    fn in_progress_reads_as_build_or_restart_by_column() {
+        // The same raw status reads differently per column: a build vs. a
+        // serve_cmd coming back up after a restart.
+        assert_eq!(pretty_status("in_progress", StatusKind::Update), "building");
+        assert_eq!(pretty_status("in_progress", StatusKind::Runtime), "restarting");
+        // Other values are column-independent.
+        assert_eq!(pretty_status("ok", StatusKind::Runtime), "ok");
+        assert_eq!(pretty_status("none", StatusKind::Runtime), "—");
+        assert_eq!(pretty_status("not_applicable", StatusKind::Update), "—");
     }
 
     #[test]
