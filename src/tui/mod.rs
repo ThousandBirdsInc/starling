@@ -7,10 +7,11 @@
 //!   j/k, ↑/↓   move selection
 //!   /          filter (Enter apply, Esc clear)
 //!   Enter      detail view for the selected resource (Esc to exit)
+//!   y          copy the visible log window to the clipboard
 //!   t          trigger the selected resource
 //!   R          restart the selected resource's serve_cmd
 //!   p          change the selected resource's preferred backend port
-//!   PgUp/PgDn  scroll logs (G / End jumps back to follow)
+//!   PgUp/PgDn  page through logs (G/End follow tail, g/Home jump to oldest)
 //!   r          refresh now
 //!   q          quit
 
@@ -49,6 +50,10 @@ mod theme {
 
 /// Braille spinner frames used for `in_progress` status.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Max log lines kept in the TUI scrollback per resource. Lines are fetched
+/// incrementally and accumulated here, so this can exceed the daemon's own ring.
+const LOG_HISTORY: usize = 2000;
 
 /// Symbol + color for a status value. `frame` advances the in-progress spinner.
 fn status_symbol(s: &str, frame: usize) -> (&'static str, Style) {
@@ -154,6 +159,20 @@ struct App {
     rows: Vec<RowItem>,
     table: TableState,
     logs: Vec<String>,
+    /// Cached result of applying `log_filter` to `logs`. Rebuilt lazily only
+    /// when `logs` or `log_filter` change — never on every frame.
+    log_view: Vec<String>,
+    /// Set when `logs`/`log_filter` change so `log_view` is rebuilt next draw.
+    log_view_dirty: bool,
+    /// Inner height (rows) of the log pane on the last frame. Drives page-sized
+    /// scrolling and scroll clamping, which both need the visible height.
+    log_view_h: usize,
+    /// Cursor for incremental log fetches: the sequence past the last line in
+    /// `logs`. Passed as `since` so each poll transfers only new lines.
+    log_cursor: u64,
+    /// The (instance, resource) `logs`/`log_cursor` belong to. When the
+    /// selection moves to a different key, the buffer is refetched from scratch.
+    log_key: Option<(String, String)>,
     mode: Mode,
     filter: String,
     /// Regex/substring filter applied to log lines (full-screen + log pane).
@@ -193,10 +212,134 @@ impl App {
         (self.start.elapsed().as_millis() / 90) as usize
     }
 
-    /// Log lines for the selected resource, filtered by `log_filter`.
-    fn filtered_logs(&self) -> Vec<String> {
-        filter_log_lines(&self.logs, &self.log_filter)
+    /// Append newly-fetched lines for the current resource and advance the
+    /// cursor. When nothing new arrived (the common idle case) this is a no-op
+    /// that leaves the filtered view cache intact — no re-filter, no realloc.
+    fn append_logs(&mut self, lines: Vec<String>, cursor: u64) {
+        self.log_cursor = cursor;
+        if lines.is_empty() {
+            return;
+        }
+        self.logs.extend(lines);
+        let overflow = self.logs.len().saturating_sub(LOG_HISTORY);
+        if overflow > 0 {
+            self.logs.drain(..overflow);
+        }
+        self.log_view_dirty = true;
     }
+
+    /// Switch the log pane to a different resource (or none): replace the buffer
+    /// wholesale and reset the cursor and scroll position.
+    fn reset_logs(&mut self, key: Option<(String, String)>, lines: Vec<String>, cursor: u64) {
+        self.log_key = key;
+        self.log_cursor = cursor;
+        self.logs = lines;
+        self.log_scroll = 0;
+        self.log_view_dirty = true;
+    }
+
+    /// Rebuild `log_view` from `logs`/`log_filter` if it went stale. Called once
+    /// per draw so the regex filter runs on change, not on every frame.
+    fn ensure_log_view(&mut self) {
+        if self.log_view_dirty {
+            self.log_view = filter_log_lines(&self.logs, &self.log_filter);
+            self.log_view_dirty = false;
+        }
+    }
+
+    /// Highest valid scroll offset: enough to bring the oldest line into view.
+    fn max_log_scroll(&self) -> usize {
+        self.log_view.len().saturating_sub(self.log_view_h)
+    }
+
+    /// One screenful for PageUp/PageDown, keeping a line of overlap for context.
+    fn page_lines(&self) -> i32 {
+        self.log_view_h.saturating_sub(1).max(1) as i32
+    }
+
+    /// Scroll by `delta` lines (positive = toward older lines), clamped to the
+    /// valid range so paging past either end never leaves the offset stuck.
+    fn scroll_logs(&mut self, delta: i32) {
+        self.log_scroll = clamp_scroll(self.log_scroll, delta, self.max_log_scroll());
+    }
+
+    /// Copy the log lines currently visible in the pane to the system clipboard
+    /// as plain text (ANSI styling stripped), and report the outcome.
+    fn copy_visible_logs(&mut self) {
+        let window = visible_window(&self.log_view, self.log_view_h, self.log_scroll);
+        let text = window.iter().map(|l| plain_log_text(l)).collect::<Vec<_>>().join("\n");
+        let n = window.len();
+        // `window` borrows `self`; it is unused past here, so `note` can borrow.
+        if n == 0 {
+            self.note("no logs to copy".into());
+            return;
+        }
+        match copy_to_clipboard(&text) {
+            Ok(()) => self.note(format!("copied {n} log lines to clipboard")),
+            Err(e) => self.note(format!("couldn't copy logs: {e}")),
+        }
+    }
+}
+
+/// Copy `text` to the system clipboard via the platform clipboard utility,
+/// mirroring how `open_url` shells out (no extra dependency). On Linux it tries
+/// the Wayland then X11 helpers in turn.
+fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        pipe_to(&mut std::process::Command::new("pbcopy"), text)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        pipe_to(&mut std::process::Command::new("clip"), text)
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let candidates: [(&str, &[&str]); 3] = [
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ];
+        let mut last = io::Error::new(
+            io::ErrorKind::NotFound,
+            "no clipboard tool found (install wl-clipboard, xclip, or xsel)",
+        );
+        for (bin, args) in candidates {
+            let mut cmd = std::process::Command::new(bin);
+            cmd.args(args);
+            match pipe_to(&mut cmd, text) {
+                Ok(()) => return Ok(()),
+                // Helper isn't installed: fall through to the next candidate.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => last = e,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
+    }
+}
+
+/// Spawn `cmd`, write `text` to its stdin, and wait for it to finish.
+fn pipe_to(cmd: &mut std::process::Command, text: &str) -> io::Result<()> {
+    use std::io::Write;
+    let mut child = cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "clipboard stdin unavailable"))?
+        .write_all(text.as_bytes())?;
+    child.wait()?;
+    Ok(())
+}
+
+/// Apply `delta` to a scroll offset and clamp it to `[0, max]`. Clamping (rather
+/// than letting the offset run past `max`) is what keeps paging responsive: an
+/// overshoot at the top doesn't have to be "unwound" before the view moves.
+fn clamp_scroll(current: usize, delta: i32, max: usize) -> usize {
+    (current as i64 + delta as i64).clamp(0, max as i64) as usize
 }
 
 /// Render a log line with ANSI SGR color/style codes translated into ratatui
@@ -394,6 +537,11 @@ async fn event_loop(
         rows: vec![],
         table: TableState::default().with_selected(Some(0)),
         logs: vec![],
+        log_view: vec![],
+        log_view_dirty: false,
+        log_view_h: 0,
+        log_cursor: 0,
+        log_key: None,
         mode: Mode::Normal,
         filter: String::new(),
         log_filter: String::new(),
@@ -417,10 +565,23 @@ async fn event_loop(
                 .unwrap_or(0)
                 .min(app.rows.len().saturating_sub(1));
             app.table.select(if app.rows.is_empty() { None } else { Some(sel) });
-            app.logs = match app.selected() {
-                Some(r) => fetch_logs(client, &r.instance_id, &r.name).await,
-                None => vec![],
-            };
+            match app.selected().map(|r| (r.instance_id.clone(), r.name.clone())) {
+                Some((instance, resource)) => {
+                    // Same resource as last tick: fetch only lines past our
+                    // cursor and append. Otherwise refetch the tail from scratch.
+                    let same = app.log_key.as_ref()
+                        == Some(&(instance.clone(), resource.clone()));
+                    let since = if same { app.log_cursor } else { 0 };
+                    let (lines, cursor) = fetch_logs(client, &instance, &resource, since).await;
+                    if same {
+                        app.append_logs(lines, cursor);
+                    } else {
+                        app.reset_logs(Some((instance, resource)), lines, cursor);
+                    }
+                }
+                None if app.log_key.is_some() => app.reset_logs(None, vec![], 0),
+                None => {}
+            }
             last_refresh = Instant::now();
         }
 
@@ -461,13 +622,16 @@ async fn event_loop(
                         KeyCode::Enter => app.mode = Mode::Logs,
                         KeyCode::Esc => {
                             app.log_filter.clear();
+                            app.log_view_dirty = true;
                             app.mode = Mode::Logs;
                         }
                         KeyCode::Backspace => {
                             app.log_filter.pop();
+                            app.log_view_dirty = true;
                         }
                         KeyCode::Char(c) => {
                             app.log_filter.push(c);
+                            app.log_view_dirty = true;
                             app.log_scroll = 0;
                         }
                         _ => {}
@@ -519,10 +683,11 @@ async fn event_loop(
                             app.mode = Mode::Normal;
                         }
                         KeyCode::Char('/') => app.mode = Mode::LogsFilter,
-                        KeyCode::PageUp | KeyCode::Char('k') | KeyCode::Up => app.log_scroll += 5,
-                        KeyCode::PageDown | KeyCode::Char('j') | KeyCode::Down => {
-                            app.log_scroll = app.log_scroll.saturating_sub(5)
-                        }
+                        KeyCode::PageUp => app.scroll_logs(app.page_lines()),
+                        KeyCode::PageDown => app.scroll_logs(-app.page_lines()),
+                        KeyCode::Char('k') | KeyCode::Up => app.scroll_logs(1),
+                        KeyCode::Char('j') | KeyCode::Down => app.scroll_logs(-1),
+                        KeyCode::Char('g') | KeyCode::Home => app.log_scroll = app.max_log_scroll(),
                         KeyCode::Char('G') | KeyCode::End => app.log_scroll = 0,
                         KeyCode::Char('o') => {
                             if let Some(r) = app.selected() {
@@ -531,6 +696,7 @@ async fn event_loop(
                                 }
                             }
                         }
+                        KeyCode::Char('y') => app.copy_visible_logs(),
                         _ => {}
                     },
                     Mode::Normal | Mode::Detail => match key.code {
@@ -562,8 +728,8 @@ async fn event_loop(
                         KeyCode::Char('r') => {
                             last_refresh = Instant::now() - Duration::from_secs(1);
                         }
-                        KeyCode::PageUp => app.log_scroll += 5,
-                        KeyCode::PageDown => app.log_scroll = app.log_scroll.saturating_sub(5),
+                        KeyCode::PageUp => app.scroll_logs(app.page_lines()),
+                        KeyCode::PageDown => app.scroll_logs(-app.page_lines()),
                         KeyCode::Char('G') | KeyCode::End => app.log_scroll = 0,
                         KeyCode::Char('t') => {
                             if let Some(r) = app.selected() {
@@ -615,6 +781,7 @@ async fn event_loop(
                                 None => {}
                             }
                         }
+                        KeyCode::Char('y') => app.copy_visible_logs(),
                         _ => {}
                     },
                 }
@@ -722,29 +889,45 @@ fn parse_port(input: &str) -> Option<u16> {
     (port != 0).then_some(port)
 }
 
-async fn fetch_logs(client: &DaemonClient, instance: &str, resource: &str) -> Vec<String> {
+/// Fetch log lines newer than `since` for a resource, returning the lines and
+/// the cursor for the next call. On error the cursor is left unchanged so the
+/// next poll retries from the same point rather than refetching the whole tail.
+async fn fetch_logs(
+    client: &DaemonClient,
+    instance: &str,
+    resource: &str,
+    since: u64,
+) -> (Vec<String>, u64) {
     match client
         .call(&Request::GetLogs {
             instance: instance.to_string(),
             resource: resource.to_string(),
+            since,
         })
         .await
     {
-        Ok(Response::Logs(l)) => l,
-        _ => vec![],
+        Ok(Response::Logs { lines, cursor }) => (lines, cursor),
+        _ => (vec![], since),
     }
 }
 
-/// Render the tail of `logs` into a pane of inner height `h`, honoring scroll.
-fn log_lines(logs: &[String], h: usize, scroll: usize) -> Vec<Line<'static>> {
-    if logs.is_empty() {
-        return vec![];
+/// The slice of `logs` currently on screen in a pane of inner height `h` at the
+/// given scroll offset (0 = tail). Shared by rendering and clipboard copy so
+/// "the current window" means exactly what the user sees.
+fn visible_window(logs: &[String], h: usize, scroll: usize) -> &[String] {
+    if logs.is_empty() || h == 0 {
+        return &[];
     }
     let max_scroll = logs.len().saturating_sub(h);
     let scroll = scroll.min(max_scroll);
     let end = logs.len() - scroll;
     let start = end.saturating_sub(h);
-    logs[start..end].iter().map(|l| ansi_log_line(l)).collect()
+    &logs[start..end]
+}
+
+/// Render the on-screen window of `logs`, honoring scroll, with ANSI styling.
+fn log_lines(logs: &[String], h: usize, scroll: usize) -> Vec<Line<'static>> {
+    visible_window(logs, h, scroll).iter().map(|l| ansi_log_line(l)).collect()
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
@@ -839,15 +1022,16 @@ fn draw(f: &mut Frame, app: &mut App) {
         .map(|r| format!("{} / {}", r.instance_name, r.name))
         .unwrap_or_else(|| "—".into());
     let h = chunks[2].height.saturating_sub(2) as usize;
+    app.log_view_h = h;
+    app.ensure_log_view();
     let follow = if app.log_scroll == 0 { "" } else { " · scrolled" };
-    let logs = app.filtered_logs();
     let filt = if app.log_filter.is_empty() {
         String::new()
     } else {
         format!(" /{}", app.log_filter)
     };
     f.render_widget(
-        Paragraph::new(log_body(&logs, h, app.log_scroll)).block(
+        Paragraph::new(log_body(&app.log_view, h, app.log_scroll)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -873,17 +1057,14 @@ fn draw(f: &mut Frame, app: &mut App) {
             Span::styled("Run `starling up` in a project.", Style::default().fg(theme::MUTED)),
         ])
     } else if let Some(msg) = app.active_status() {
-        Line::from(vec![
-            Span::raw(" "),
-            Span::styled("● ", Style::default().fg(theme::ACCENT)),
-            Span::styled(msg.to_string(), Style::default().fg(Color::White)),
-        ])
+        status_footer(msg)
     } else {
         key_hints(&[
             ("j/k", "move"),
             ("↵", "detail"),
             ("l", "logs"),
             ("o", "open"),
+            ("y", "copy logs"),
             ("t", "trigger"),
             ("R", "restart"),
             ("p", "port"),
@@ -925,6 +1106,15 @@ fn prompt_line(label: &str, value: &str, hint: &str) -> Line<'static> {
         Span::styled(format!("{label} "), Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
         Span::styled(format!("{value}\u{2588}"), Style::default().fg(Color::White)),
         Span::styled(format!("   {hint} "), Style::default().fg(theme::MUTED)),
+    ])
+}
+
+/// Footer line showing a transient status message (e.g. a copy confirmation).
+fn status_footer(msg: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled("● ", Style::default().fg(theme::ACCENT)),
+        Span::styled(msg.to_string(), Style::default().fg(Color::White)),
     ])
 }
 
@@ -1022,8 +1212,10 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
     );
 
     let h = chunks[2].height.saturating_sub(2) as usize;
+    app.log_view_h = h;
+    app.ensure_log_view();
     f.render_widget(
-        Paragraph::new(log_body(&app.logs, h, app.log_scroll)).block(
+        Paragraph::new(log_body(&app.log_view, h, app.log_scroll)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -1033,19 +1225,21 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
         chunks[2],
     );
 
-    f.render_widget(
-        Paragraph::new(key_hints(&[
+    let detail_footer = match app.active_status() {
+        Some(msg) => status_footer(msg),
+        None => key_hints(&[
             ("Esc/↵", "back"),
             ("l", "full logs"),
             ("o", "open"),
+            ("y", "copy logs"),
             ("t", "trigger"),
             ("R", "restart"),
             ("p", "port"),
             ("PgUp/Dn", "scroll"),
             ("q", "quit"),
-        ])),
-        chunks[3],
-    );
+        ]),
+    };
+    f.render_widget(Paragraph::new(detail_footer), chunks[3]);
 }
 
 fn bold() -> Style {
@@ -1055,8 +1249,8 @@ fn bold() -> Style {
 #[cfg(test)]
 mod tests {
     use super::{
-        ansi_log_line, filter_log_lines, hostname_from_url, parse_port, plain_log_text,
-        route_port_for_url,
+        ansi_log_line, clamp_scroll, filter_log_lines, hostname_from_url, parse_port,
+        plain_log_text, route_port_for_url, visible_window,
     };
     use crate::daemon::protocol::{DashboardState, RouteInfo};
     use ratatui::style::{Color, Modifier};
@@ -1114,6 +1308,36 @@ mod tests {
     }
 
     #[test]
+    fn visible_window_is_the_on_screen_slice() {
+        let logs: Vec<String> = (0..10).map(|i| i.to_string()).collect();
+        // Following the tail: the last `h` lines.
+        assert_eq!(visible_window(&logs, 3, 0), &["7", "8", "9"]);
+        // Scrolled up two lines from the tail.
+        assert_eq!(visible_window(&logs, 3, 2), &["5", "6", "7"]);
+        // Scroll past the top is clamped to the oldest lines.
+        assert_eq!(visible_window(&logs, 3, 999), &["0", "1", "2"]);
+        // Fewer lines than the pane height: all of them.
+        assert_eq!(visible_window(&logs[..2], 5, 0), &["0", "1"]);
+        // Degenerate cases yield nothing (and don't panic).
+        assert!(visible_window(&logs, 0, 0).is_empty());
+        assert!(visible_window(&[], 3, 0).is_empty());
+    }
+
+    #[test]
+    fn scroll_stays_clamped_and_never_sticks_past_the_ends() {
+        // A page up from the tail moves by the delta.
+        assert_eq!(clamp_scroll(0, 9, 100), 9);
+        // Paging past the oldest line pins to max instead of overshooting, so
+        // the next page down immediately moves the view (no stuck counter).
+        assert_eq!(clamp_scroll(95, 50, 100), 100);
+        assert_eq!(clamp_scroll(100, -9, 100), 91);
+        // Paging below the tail pins to 0 (follow mode).
+        assert_eq!(clamp_scroll(5, -9, 100), 0);
+        // When everything fits (max 0), scrolling is a no-op.
+        assert_eq!(clamp_scroll(0, 9, 0), 0);
+    }
+
+    #[test]
     fn parses_valid_backend_ports() {
         assert_eq!(parse_port("1"), Some(1));
         assert_eq!(parse_port("65535"), Some(65535));
@@ -1168,15 +1392,18 @@ fn draw_logs_fullscreen(f: &mut Frame, app: &mut App) {
         ])
         .split(f.area());
 
+    let h = chunks[1].height.saturating_sub(2) as usize;
+    app.log_view_h = h;
+    app.ensure_log_view();
+
     let sel = app
         .selected()
         .map(|r| format!("{} / {}", r.instance_name, r.name))
         .unwrap_or_else(|| "—".into());
-    let logs = app.filtered_logs();
     let matched = if app.log_filter.is_empty() {
-        format!("{} lines", logs.len())
+        format!("{} lines", app.log_view.len())
     } else {
-        format!("{} matching /{}", logs.len(), app.log_filter)
+        format!("{} matching /{}", app.log_view.len(), app.log_filter)
     };
     let banner = Line::from(vec![
         Span::styled(
@@ -1196,9 +1423,8 @@ fn draw_logs_fullscreen(f: &mut Frame, app: &mut App) {
         chunks[0],
     );
 
-    let h = chunks[1].height.saturating_sub(2) as usize;
     f.render_widget(
-        Paragraph::new(log_body(&logs, h, app.log_scroll)).block(
+        Paragraph::new(log_body(&app.log_view, h, app.log_scroll)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -1209,11 +1435,14 @@ fn draw_logs_fullscreen(f: &mut Frame, app: &mut App) {
 
     let footer: Line = if app.mode == Mode::LogsFilter {
         prompt_line("filter", &app.log_filter, "Enter apply · Esc clear")
+    } else if let Some(msg) = app.active_status() {
+        status_footer(msg)
     } else {
         key_hints(&[
             ("/", "filter"),
-            ("PgUp/Dn", "scroll"),
-            ("G", "tail"),
+            ("PgUp/Dn", "page"),
+            ("g/G", "top/tail"),
+            ("y", "copy"),
             ("o", "open"),
             ("l/Esc", "back"),
             ("q", "quit"),

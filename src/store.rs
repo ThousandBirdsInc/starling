@@ -90,24 +90,22 @@ impl Store {
         self.inner.lock().unwrap().log_segments.len() as i32
     }
 
-    /// Last `tail` log lines per span (resource name), for the daemon dashboard.
-    /// The empty global span is reported under "(system)".
-    pub fn recent_logs_by_resource(&self, tail: usize) -> BTreeMap<String, Vec<String>> {
+    /// Log lines appended since `checkpoint`, grouped by span (resource name),
+    /// for the daemon dashboard. The empty global span is reported under
+    /// "(system)". Returns the new checkpoint (the current segment count) to
+    /// pass back on the next call so only fresh lines are sent each tick.
+    pub fn logs_since(&self, checkpoint: usize) -> (BTreeMap<String, Vec<String>>, usize) {
         let inner = self.inner.lock().unwrap();
+        let total = inner.log_segments.len();
+        let start = checkpoint.min(total);
         let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for seg in &inner.log_segments {
+        for seg in &inner.log_segments[start..] {
             let span = seg.span_id.clone().unwrap_or_default();
             let key = if span.is_empty() { "(system)".to_string() } else { span };
             let text = seg.text.clone().unwrap_or_default();
             out.entry(key).or_default().push(text.trim_end().to_string());
         }
-        for lines in out.values_mut() {
-            if lines.len() > tail {
-                let start = lines.len() - tail;
-                *lines = lines.split_off(start);
-            }
-        }
-        out
+        (out, total)
     }
 
     // -- view assembly -----------------------------------------------------

@@ -104,7 +104,9 @@ pub enum Request {
     Deregister {
         instance: String,
     },
-    /// Push the instance's current resources + recent per-resource logs.
+    /// Push the instance's current resources plus the log lines appended since
+    /// the reporter's previous push. The daemon appends these to its
+    /// per-resource ring (it does not replace), so each line is sent once.
     Update {
         instance: String,
         resources: Vec<ResourceSnapshot>,
@@ -135,10 +137,12 @@ pub enum Request {
     },
     /// Dashboard: fetch aggregated state.
     GetState,
-    /// Dashboard: fetch the recent logs for a resource.
+    /// Dashboard: fetch log lines for a resource newer than `since` (a cursor
+    /// from a prior `Logs` response). Pass `0` to fetch the full retained tail.
     GetLogs {
         instance: String,
         resource: String,
+        since: u64,
     },
     /// Instance: pull (and clear) pending commands queued by the dashboard.
     PollCommands {
@@ -183,7 +187,11 @@ pub enum Response {
         conflict: bool,
     },
     State(DashboardState),
-    Logs(Vec<String>),
+    /// Log lines for a resource, plus the cursor to pass as `since` next time.
+    Logs {
+        lines: Vec<String>,
+        cursor: u64,
+    },
     Commands(Vec<Command>),
     ShutdownQueued {
         instances: Vec<InstanceState>,

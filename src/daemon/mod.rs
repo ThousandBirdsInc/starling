@@ -25,9 +25,43 @@ const INSTANCE_TTL: Duration = Duration::from_secs(10);
 
 struct Instance {
     state: InstanceState,
-    logs: HashMap<String, VecDeque<String>>,
+    logs: HashMap<String, LogRing>,
     commands: Vec<Command>,
     last_seen: Instant,
+}
+
+/// A capped ring of recent log lines tagged with absolute sequence numbers, so
+/// the dashboard can fetch only the lines newer than a cursor it already holds.
+#[derive(Default)]
+struct LogRing {
+    lines: VecDeque<String>,
+    /// Absolute sequence of `lines.front()`. `start + lines.len()` is the
+    /// sequence the next appended line will get (also the "end" cursor).
+    start: u64,
+}
+
+impl LogRing {
+    /// Append new lines, dropping the oldest beyond `LOG_RING` (which advances
+    /// `start`, so retained lines keep their original sequence numbers).
+    fn append(&mut self, incoming: impl IntoIterator<Item = String>) {
+        self.lines.extend(incoming);
+        while self.lines.len() > LOG_RING {
+            self.lines.pop_front();
+            self.start += 1;
+        }
+    }
+
+    fn end(&self) -> u64 {
+        self.start + self.lines.len() as u64
+    }
+
+    /// Lines with sequence `>= since`, plus the new end cursor. A `since` older
+    /// than what's retained yields everything still in the ring.
+    fn since(&self, since: u64) -> (Vec<String>, u64) {
+        let skip = since.saturating_sub(self.start) as usize;
+        let lines = self.lines.iter().skip(skip).cloned().collect();
+        (lines, self.end())
+    }
 }
 
 #[derive(Default)]
@@ -198,14 +232,11 @@ impl Daemon {
                 if let Some(inst) = inner.instances.get_mut(&instance) {
                     inst.state.resources = resources;
                     inst.last_seen = Instant::now();
-                    // The reporter sends the full recent tail each tick, so
-                    // replace (don't append) to avoid duplicating lines.
+                    // The reporter sends only lines appended since its last
+                    // push, so append (don't replace) to preserve scrollback
+                    // and keep each line's sequence stable across fetches.
                     for (res, lines) in logs {
-                        let mut dq: VecDeque<String> = lines.into_iter().collect();
-                        while dq.len() > LOG_RING {
-                            dq.pop_front();
-                        }
-                        inst.logs.insert(res, dq);
+                        inst.logs.entry(res).or_default().append(lines);
                     }
                     Response::Ok
                 } else {
@@ -305,15 +336,19 @@ impl Daemon {
                 })
             }
 
-            Request::GetLogs { instance, resource } => {
+            Request::GetLogs {
+                instance,
+                resource,
+                since,
+            } => {
                 let inner = self.inner.lock().await;
-                let lines = inner
+                let (lines, cursor) = inner
                     .instances
                     .get(&instance)
                     .and_then(|i| i.logs.get(&resource))
-                    .map(|r| r.iter().cloned().collect())
+                    .map(|r| r.since(since))
                     .unwrap_or_default();
-                Response::Logs(lines)
+                Response::Logs { lines, cursor }
             }
 
             Request::PollCommands { instance } => {
@@ -501,6 +536,42 @@ mod tests {
             lan: false,
             lan_ip: String::new(),
         }
+    }
+
+    #[test]
+    fn log_ring_serves_only_lines_newer_than_cursor() {
+        let mut ring = LogRing::default();
+        ring.append(["a".to_string(), "b".to_string()]);
+
+        // since 0 returns everything plus the end cursor.
+        let (lines, cursor) = ring.since(0);
+        assert_eq!(lines, vec!["a", "b"]);
+        assert_eq!(cursor, 2);
+
+        // Nothing new since the last cursor.
+        ring.append(["c".to_string()]);
+        let (lines, cursor) = ring.since(cursor);
+        assert_eq!(lines, vec!["c"]);
+        assert_eq!(cursor, 3);
+        assert_eq!(ring.since(cursor).0, Vec::<String>::new());
+    }
+
+    #[test]
+    fn log_ring_drops_oldest_but_keeps_sequence_stable() {
+        let mut ring = LogRing::default();
+        for i in 0..(LOG_RING + 10) {
+            ring.append([format!("line {i}")]);
+        }
+        // Capped to LOG_RING, end cursor counts every line ever appended, and
+        // the oldest 10 sequences (0..10) have aged out.
+        assert_eq!(ring.lines.len(), LOG_RING);
+        assert_eq!(ring.end(), (LOG_RING + 10) as u64);
+        assert_eq!(ring.start, 10);
+        // A cursor pointing at dropped lines just gets what's still retained.
+        let (lines, cursor) = ring.since(0);
+        assert_eq!(lines.len(), LOG_RING);
+        assert_eq!(lines[0], "line 10");
+        assert_eq!(cursor, (LOG_RING + 10) as u64);
     }
 
     #[tokio::test]

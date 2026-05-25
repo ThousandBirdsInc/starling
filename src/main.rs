@@ -673,10 +673,11 @@ async fn logs(args: LogsArgs) -> anyhow::Result<()> {
             .call(&Request::GetLogs {
                 instance: instance_id.clone(),
                 resource: resource.clone(),
+                since: 0,
             })
             .await?
         {
-            Response::Logs(lines) => tail_lines(lines, args.tail),
+            Response::Logs { lines, .. } => tail_lines(lines, args.tail),
             other => anyhow::bail!("daemon returned unexpected response: {other:?}"),
         };
         outputs.push((instance_id, instance_name, resource, lines));
@@ -1341,13 +1342,17 @@ async fn up(args: UpArgs) {
         let shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(1000));
+            // Segment count already pushed to the daemon; only newer lines go
+            // out each tick so the daemon appends rather than re-sending tails.
+            let mut log_checkpoint = 0usize;
             loop {
                 tick.tick().await;
                 let view = store.full_view();
                 let resources: Vec<ResourceSnapshot> =
                     view.ui_resources.iter().map(snapshot).collect();
-                let logs: HashMap<String, Vec<String>> =
-                    store.recent_logs_by_resource(120).into_iter().collect();
+                let (logs_by_resource, checkpoint) = store.logs_since(log_checkpoint);
+                log_checkpoint = checkpoint;
+                let logs: HashMap<String, Vec<String>> = logs_by_resource.into_iter().collect();
                 let _ = client
                     .call(&Request::Update {
                         instance: instance.clone(),
