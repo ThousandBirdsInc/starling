@@ -3079,7 +3079,7 @@ dependencies = [
 
 [[package]]
 name = "starling-devex"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "allocative",
  "anyhow",
