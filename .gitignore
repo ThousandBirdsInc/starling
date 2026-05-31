@@ -33,3 +33,6 @@ web/.pnp.*
 # Root-level editor dirs only (web/.vscode is vendored from upstream Tilt).
 /.idea/
 /.vscode/
+
+# ── Claude Code agent state (local scratch: memory, settings) ─────────────────
+/.claude/
