@@ -26,8 +26,8 @@ use tokio::sync::mpsc;
 use crate::api::v1alpha1::*;
 use crate::proxy::PortReservation;
 use crate::starlingfile::{
-    self, Cmd, IgnoreRule, LoadOptions, Manifest, NamedPortLease, PortForwardSpec, ReadinessProbe,
-    TargetKind,
+    self, Cmd, IgnoreRule, LoadOptions, Manifest, NamedPortLease, PortForwardSpec, ProbeAction,
+    ProbePort, ReadinessProbe, TargetKind,
 };
 use crate::store::{BuildRequest, Store};
 
@@ -947,8 +947,14 @@ impl Engine {
                     let health_task = route_monitor
                         .as_ref()
                         .map(ServeRouteMonitor::start_health_checks);
-                    let probe_task =
-                        readiness.map(|p| spawn_readiness_probe(p, store.clone(), name.clone()));
+                    let probe_task = readiness.map(|p| {
+                        spawn_readiness_probe(
+                            p,
+                            store.clone(),
+                            name.clone(),
+                            service_registry.clone(),
+                        )
+                    });
                     let status = child.wait().await;
                     if let Some(task) = health_task {
                         task.abort();
@@ -3607,6 +3613,7 @@ fn spawn_readiness_probe(
     probe: ReadinessProbe,
     store: Arc<Store>,
     name: String,
+    registry: Arc<Mutex<HashMap<String, ServiceEndpoint>>>,
 ) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
         let timeout = Duration::from_secs_f64(probe.timeout_secs.max(0.1));
@@ -3623,7 +3630,11 @@ fn spawn_readiness_probe(
         let mut tick = tokio::time::interval(period);
         loop {
             tick.tick().await;
-            let result = crate::probe::run_probe_action(&probe.action, timeout).await;
+            let action = resolve_probe_action_ports(&probe.action, &registry);
+            let result = match action {
+                Ok(action) => crate::probe::run_probe_action(&action, timeout).await,
+                Err(err) => Err(err),
+            };
             if result.is_ok() {
                 success_count += 1;
                 failure_count = 0;
@@ -3690,6 +3701,55 @@ fn spawn_readiness_probe(
         }
     })
     .abort_handle()
+}
+
+fn resolve_probe_action_ports(
+    action: &ProbeAction,
+    registry: &Arc<Mutex<HashMap<String, ServiceEndpoint>>>,
+) -> Result<ProbeAction, String> {
+    match action {
+        ProbeAction::Exec { command } => Ok(ProbeAction::Exec {
+            command: command.clone(),
+        }),
+        ProbeAction::Tcp { host, port } => Ok(ProbeAction::Tcp {
+            host: host.clone(),
+            port: resolve_probe_port(port, registry)?,
+        }),
+        ProbeAction::Http {
+            host,
+            port,
+            scheme,
+            path,
+        } => Ok(ProbeAction::Http {
+            host: host.clone(),
+            port: resolve_probe_port(port, registry)?,
+            scheme: scheme.clone(),
+            path: path.clone(),
+        }),
+    }
+}
+
+fn resolve_probe_port(
+    port: &ProbePort,
+    registry: &Arc<Mutex<HashMap<String, ServiceEndpoint>>>,
+) -> Result<ProbePort, String> {
+    match port {
+        ProbePort::Number(_) => Ok(port.clone()),
+        ProbePort::Deferred(raw) => {
+            let key = raw
+                .strip_prefix("${")
+                .and_then(|s| s.strip_suffix('}'))
+                .unwrap_or(raw);
+            let value = service_env(registry)
+                .into_iter()
+                .find_map(|(name, value)| (name == key).then_some(value))
+                .ok_or_else(|| format!("could not resolve probe port {raw}"))?;
+            let port = value
+                .parse::<u16>()
+                .map_err(|_| format!("probe port {raw} resolved to invalid value {value:?}"))?;
+            Ok(ProbePort::Number(port))
+        }
+    }
 }
 
 #[derive(Clone)]

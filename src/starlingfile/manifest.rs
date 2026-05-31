@@ -17,14 +17,46 @@ pub enum ProbeAction {
     /// Run a command in a subprocess; success = exit status 0.
     Exec { command: Vec<String> },
     /// Open a TCP connection; success = connection established.
-    Tcp { host: String, port: u16 },
+    Tcp { host: String, port: ProbePort },
     /// Issue an HTTP GET; success = response status < 400.
     Http {
         host: String,
-        port: u16,
+        port: ProbePort,
         scheme: String,
         path: String,
     },
+}
+
+/// A probe port can be a literal number or a deferred Starling env reference
+/// such as `${STARLING_POSTGRES_PORT}` from `starling_port(...)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProbePort {
+    Number(u16),
+    Deferred(String),
+}
+
+impl ProbePort {
+    pub fn as_u16(&self) -> Result<u16, String> {
+        match self {
+            ProbePort::Number(port) => Ok(*port),
+            ProbePort::Deferred(port) => resolve_deferred_port(port),
+        }
+    }
+}
+
+fn resolve_deferred_port(port: &str) -> Result<u16, String> {
+    if let Ok(port) = port.parse::<u16>() {
+        return Ok(port);
+    }
+    let env_name = port
+        .strip_prefix("${")
+        .and_then(|s| s.strip_suffix('}'))
+        .unwrap_or(port);
+    std::env::var(env_name)
+        .map_err(|_| format!("could not resolve probe port {port}"))?
+        .parse::<u16>()
+        .map_err(|_| format!("probe port {port} did not resolve to a valid TCP port"))
 }
 
 /// A readiness probe (Tilt's `probe(...)`). Gates a `serve_cmd` resource to

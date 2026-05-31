@@ -17,13 +17,13 @@ use crate::starlingfile::ProbeAction;
 pub async fn run_probe_action(action: &ProbeAction, timeout: Duration) -> Result<(), String> {
     match action {
         ProbeAction::Exec { command } => exec_probe(command, timeout).await,
-        ProbeAction::Tcp { host, port } => tcp_probe(host, *port, timeout).await,
+        ProbeAction::Tcp { host, port } => tcp_probe(host, port.as_u16()?, timeout).await,
         ProbeAction::Http {
             host,
             port,
             scheme,
             path,
-        } => http_probe(host, *port, scheme, path, timeout).await,
+        } => http_probe(host, port.as_u16()?, scheme, path, timeout).await,
     }
 }
 
@@ -130,6 +130,7 @@ async fn http_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::starlingfile::ProbePort;
 
     #[tokio::test]
     async fn exec_probe_reflects_exit_status() {
@@ -172,7 +173,7 @@ mod tests {
         let ok = run_probe_action(
             &ProbeAction::Tcp {
                 host: "127.0.0.1".into(),
-                port,
+                port: ProbePort::Number(port),
             },
             Duration::from_secs(1),
         )
@@ -188,7 +189,7 @@ mod tests {
         let fail = run_probe_action(
             &ProbeAction::Tcp {
                 host: "127.0.0.1".into(),
-                port: 1,
+                port: ProbePort::Number(1),
             },
             Duration::from_secs(1),
         )

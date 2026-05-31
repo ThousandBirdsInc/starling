@@ -70,7 +70,7 @@ fn coerce_str(v: Value) -> Option<String> {
 
 pub use manifest::{
     Cmd, DockerBuild, IgnoreRule, LiveUpdateStep, Manifest, NamedPortLease, PortForwardSpec,
-    ProbeAction, ReadinessProbe, TargetKind,
+    ProbeAction, ProbePort, ReadinessProbe, TargetKind,
 };
 
 /// Separator for encoding live_update steps as strings returned by sync()/run().
@@ -1466,6 +1466,23 @@ fn valid_port(port: i32) -> Option<u16> {
     (port > 0 && port < 65536).then_some(port as u16)
 }
 
+fn probe_port_arg<'v>(fn_name: &str, port: Value<'v>) -> anyhow::Result<ProbePort> {
+    if let Some(port) = port.unpack_i32() {
+        return valid_port(port)
+            .map(ProbePort::Number)
+            .ok_or_else(|| anyhow!("{fn_name}(port={port}): port out of range"));
+    }
+    if let Some(port) = port.unpack_str() {
+        if port.trim().is_empty() {
+            return Err(anyhow!("{fn_name}(port=...): port must be non-empty"));
+        }
+        return Ok(ProbePort::Deferred(port.to_string()));
+    }
+    Err(anyhow!(
+        "{fn_name}(port=...): port must be an integer or starling_port(...) value"
+    ))
+}
+
 fn parse_port_forward_specs(v: Value) -> Result<Vec<PortForwardSpec>> {
     let specs = match v.unpack_i32().and_then(valid_port) {
         Some(port) => vec![PortForwardSpec {
@@ -2072,17 +2089,15 @@ fn starling_builtins(builder: &mut GlobalsBuilder) {
     /// A probe action that issues an HTTP GET; success = status < 400 (Tilt's
     /// `http_get_action(port, host, scheme, path)`).
     fn http_get_action<'v>(
-        port: i32,
+        port: Value<'v>,
         #[starlark(require = named, default = NoneType)] host: Value<'v>,
         #[starlark(require = named, default = NoneType)] scheme: Value<'v>,
         #[starlark(require = named, default = NoneType)] path: Value<'v>,
     ) -> anyhow::Result<String> {
-        if port <= 0 || port >= 65536 {
-            return Err(anyhow!("http_get_action(port={port}): port out of range"));
-        }
+        let port = probe_port_arg("http_get_action", port)?;
         let action = ProbeAction::Http {
             host: host.unpack_str().unwrap_or("127.0.0.1").to_string(),
-            port: port as u16,
+            port,
             scheme: scheme.unpack_str().unwrap_or("http").to_string(),
             path: path.unpack_str().unwrap_or("/").to_string(),
         };
@@ -2103,15 +2118,13 @@ fn starling_builtins(builder: &mut GlobalsBuilder) {
     /// A probe action that opens a TCP connection; success = connection
     /// established (Tilt's `tcp_socket_action(port, host)`).
     fn tcp_socket_action<'v>(
-        port: i32,
+        port: Value<'v>,
         #[starlark(require = named, default = NoneType)] host: Value<'v>,
     ) -> anyhow::Result<String> {
-        if port <= 0 || port >= 65536 {
-            return Err(anyhow!("tcp_socket_action(port={port}): port out of range"));
-        }
+        let port = probe_port_arg("tcp_socket_action", port)?;
         let action = ProbeAction::Tcp {
             host: host.unpack_str().unwrap_or("127.0.0.1").to_string(),
-            port: port as u16,
+            port,
         };
         Ok(serde_json::to_string(&action).expect("action serializes"))
     }
@@ -4438,7 +4451,7 @@ mod tests {
     use super::{
         as_bat_cmd, check_version_constraint, helm_template_args, image_matches, image_repo, load,
         load_with_options, parse_object_selector, posix_relpath, shell_argv, LiveUpdateStep,
-        LoadOptions, ProbeAction, TargetKind,
+        LoadOptions, ProbeAction, ProbePort, TargetKind,
     };
 
     #[test]
@@ -6455,7 +6468,7 @@ local_resource(
         match &probe.action {
             ProbeAction::Tcp { host, port } => {
                 assert_eq!(host, "127.0.0.1");
-                assert_eq!(*port, 4321);
+                assert!(matches!(port, ProbePort::Number(4321)));
             }
             other => panic!("expected tcp probe, got {other:?}"),
         }
@@ -6535,6 +6548,41 @@ local_resource("api", serve_cmd="echo ${STARLING_CONTROL_PLANE_POSTGRES_PORT} " 
             result.manifests[0].serve_cmd.argv[2],
             "echo ${STARLING_CONTROL_PLANE_POSTGRES_PORT} ${STARLING_CONTROL_PLANE_POSTGRES_PORT}"
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn starling_port_can_feed_tcp_socket_action() {
+        let dir =
+            std::env::temp_dir().join(format!("starling-port-probe-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Starlingfile");
+        fs::write(
+            &file,
+            r#"
+pg_port = starling_port("control-plane-postgres", preferred=54330)
+local_resource(
+    "api",
+    serve_cmd="echo serving",
+    readiness_probe=probe(tcp_socket=tcp_socket_action(pg_port)),
+)
+"#,
+        )
+        .unwrap();
+
+        let result = load(&file).unwrap();
+        let probe = result.manifests[0].readiness_probe.as_ref().unwrap();
+        match &probe.action {
+            ProbeAction::Tcp { port, .. } => {
+                assert!(matches!(
+                    port,
+                    ProbePort::Deferred(value)
+                        if value == "${STARLING_CONTROL_PLANE_POSTGRES_PORT}"
+                ));
+            }
+            other => panic!("expected tcp probe, got {other:?}"),
+        }
 
         let _ = fs::remove_dir_all(dir);
     }

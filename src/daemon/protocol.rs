@@ -39,6 +39,7 @@ pub fn log_path() -> PathBuf {
 pub struct ResourceSnapshot {
     pub name: String,
     pub kind: String,
+    #[serde(default)]
     pub paused: bool,
     pub update_status: String,
     pub runtime_status: String,
@@ -307,5 +308,37 @@ mod tests {
         let json = r#"{"id":"i","name":"n","dir":"d","pid":1,"resources":[]}"#;
         let state: InstanceState = serde_json::from_str(json).unwrap();
         assert!(state.objects.is_empty());
+    }
+
+    #[test]
+    fn resource_snapshot_paused_defaults_for_old_peers() {
+        // `paused` was added after the original daemon protocol. Mixed-version
+        // daemons/instances must still render existing resource snapshots.
+        let json = r#"{
+            "name":"web",
+            "kind":"local",
+            "update_status":"ok",
+            "runtime_status":"ok",
+            "pod":null,
+            "url":null,
+            "proxy_status":null,
+            "proxy_message":null,
+            "build_count":1,
+            "last_deploy":null,
+            "restart_count":null,
+            "last_start":null
+        }"#;
+        let snapshot: ResourceSnapshot = serde_json::from_str(json).unwrap();
+        assert!(!snapshot.paused);
+    }
+
+    #[test]
+    fn state_response_resource_paused_defaults_for_old_peers() {
+        let json = r#"{"State":{"instances":[{"id":"i","name":"n","dir":"d","pid":1,"resources":[{"name":"web","kind":"local","update_status":"ok","runtime_status":"ok","pod":null,"url":null,"proxy_status":null,"proxy_message":null,"build_count":1,"last_deploy":null,"restart_count":null,"last_start":null}]}],"routes":[],"proxy_port":1360,"tld":"localhost"}}"#;
+        let response: Response = serde_json::from_str(json).unwrap();
+        let Response::State(state) = response else {
+            panic!("wrong response");
+        };
+        assert!(!state.instances[0].resources[0].paused);
     }
 }
