@@ -71,6 +71,20 @@ enum Command {
     Get(GetArgs),
     /// Show a single API object in detail (Tilt's `tilt describe`).
     Describe(DescribeArgs),
+    /// Create or update API objects from a file (Tilt's `tilt apply`).
+    Apply(ApplyArgs),
+    /// Create an API object from a file (Tilt's `tilt create`).
+    Create(ApplyArgs),
+    /// Merge-patch an API object (Tilt's `tilt patch`).
+    Patch(PatchArgs),
+    /// Delete an API object (Tilt's `tilt delete`).
+    Delete(DeleteArgs),
+    /// Wait until an API object reaches a condition (Tilt's `tilt wait`).
+    Wait(WaitArgs),
+    /// Edit an API object in $EDITOR and apply the result (Tilt's `tilt edit`).
+    Edit(EditArgs),
+    /// Language-server mode (Tilt's `tilt lsp`) — not supported by Starling.
+    Lsp,
     /// List the API object kinds available (Tilt's `tilt api-resources`).
     ApiResources,
     /// Print the Starling version (Tilt's `tilt version`).
@@ -237,6 +251,74 @@ struct DownArgs {
     /// to ./Tiltfile, matching `starling up`.
     #[arg(long)]
     file: Option<String>,
+    /// Tiltfile args passed after `--` (accepted for `tilt down` parity).
+    #[arg(last = true)]
+    tiltfile_args: Vec<String>,
+}
+
+/// Shared by `apply` and `create`: a manifest file of one or more API objects.
+#[derive(Parser)]
+struct ApplyArgs {
+    /// File of one or more API objects (YAML or JSON; `---`-separated docs).
+    #[arg(short = 'f', long = "filename")]
+    file: String,
+    /// Config to identify the project. Defaults to ./Starlingfile, then ./Tiltfile.
+    #[arg(long = "config")]
+    config: Option<String>,
+}
+
+#[derive(Parser)]
+struct PatchArgs {
+    /// Object kind (e.g. KubernetesApply, Cmd, FileWatch).
+    kind: String,
+    /// Object name.
+    name: String,
+    /// RFC 7386 JSON merge patch, e.g. `{"spec":{"queue":["web"]}}`.
+    #[arg(short = 'p', long = "patch")]
+    patch: String,
+    /// Config to identify the project. Defaults to ./Starlingfile, then ./Tiltfile.
+    #[arg(long = "config")]
+    config: Option<String>,
+}
+
+#[derive(Parser)]
+struct DeleteArgs {
+    /// Object kind (e.g. KubernetesApply, Cmd, FileWatch).
+    kind: String,
+    /// Object name.
+    name: String,
+    /// Config to identify the project. Defaults to ./Starlingfile, then ./Tiltfile.
+    #[arg(long = "config")]
+    config: Option<String>,
+}
+
+#[derive(Parser)]
+struct WaitArgs {
+    /// Object kind (e.g. KubernetesApply, KubernetesDiscovery).
+    kind: String,
+    /// Object name.
+    name: String,
+    /// Condition to wait for, as a `jsonpath=value` over the object, e.g.
+    /// `--for=status.error=` (empty) or `--for=status.readyPods=1`.
+    #[arg(long = "for", default_value = "")]
+    condition: String,
+    /// Give up after this many seconds.
+    #[arg(long, default_value_t = 30)]
+    timeout: u64,
+    /// Config to identify the project. Defaults to ./Starlingfile, then ./Tiltfile.
+    #[arg(long = "config")]
+    config: Option<String>,
+}
+
+#[derive(Parser)]
+struct EditArgs {
+    /// Object kind (e.g. KubernetesApply, Cmd).
+    kind: String,
+    /// Object name.
+    name: String,
+    /// Config to identify the project. Defaults to ./Starlingfile, then ./Tiltfile.
+    #[arg(long = "config")]
+    config: Option<String>,
 }
 
 #[derive(Parser)]
@@ -433,6 +515,49 @@ async fn main() {
                 eprintln!("starling describe: {e}");
                 std::process::exit(1);
             }
+        }
+        Some(Command::Apply(a)) => {
+            if let Err(e) = apply_objects(a, false).await {
+                eprintln!("starling apply: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Create(a)) => {
+            if let Err(e) = apply_objects(a, true).await {
+                eprintln!("starling create: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Patch(a)) => {
+            if let Err(e) = patch_object(a).await {
+                eprintln!("starling patch: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Delete(a)) => {
+            if let Err(e) = delete_object(a).await {
+                eprintln!("starling delete: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Wait(a)) => {
+            if let Err(e) = wait_object(a).await {
+                eprintln!("starling wait: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Edit(a)) => {
+            if let Err(e) = edit_object(a).await {
+                eprintln!("starling edit: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Lsp) => {
+            eprintln!(
+                "starling lsp: Starling does not provide a Tiltfile language server. \
+                 Use your editor's Starlark/Python support for Starlingfiles."
+            );
+            std::process::exit(1);
         }
         Some(Command::ApiResources) => {
             if let Err(e) = get(GetArgs {
@@ -757,6 +882,278 @@ async fn describe(args: DescribeArgs) -> anyhow::Result<()> {
         println!("Status:\n{}", serde_json::to_string_pretty(status)?);
     }
     Ok(())
+}
+
+/// Resolve the API-server `host:port` of every running instance for the current
+/// project (those that have reported one). The CLI write verbs issue HTTP CRUD
+/// directly against this authoritative object store.
+async fn instance_api_addrs(
+    client: &DaemonClient,
+    config: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    let config_path = resolve_config(config);
+    let dir = project_dir(&config_path);
+    let Response::State(state) = client.call(&Request::GetState).await? else {
+        anyhow::bail!("could not query daemon state");
+    };
+    let addrs: Vec<String> = state
+        .instances
+        .iter()
+        .filter(|i| i.dir == dir)
+        .filter_map(|i| i.api_addr.clone())
+        .collect();
+    if addrs.is_empty() {
+        anyhow::bail!("no running Starling instance with an API server found for {dir}");
+    }
+    Ok(addrs)
+}
+
+/// Minimal localhost HTTP/1.1 client for the engine's object-store API. Returns
+/// `(status_code, body_json)`. Uses `Connection: close` and reads to EOF, so it
+/// relies on the `Content-Length` bodies axum emits (no chunked decoding).
+async fn api_http(
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> anyhow::Result<(u16, serde_json::Value)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect {addr}: {e}"))?;
+    let body_bytes = match body {
+        Some(b) => serde_json::to_vec(b)?,
+        None => Vec::new(),
+    };
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    if body.is_some() {
+        req.push_str("Content-Type: application/json\r\n");
+        req.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
+    }
+    req.push_str("\r\n");
+    stream.write_all(req.as_bytes()).await?;
+    if !body_bytes.is_empty() {
+        stream.write_all(&body_bytes).await?;
+    }
+    stream.flush().await?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await?;
+    let text = String::from_utf8_lossy(&buf);
+    let (head, rest) = text.split_once("\r\n\r\n").unwrap_or((text.as_ref(), ""));
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("malformed HTTP response from {addr}"))?;
+    let json = if rest.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(rest.trim()).unwrap_or(serde_json::Value::Null)
+    };
+    Ok((status, json))
+}
+
+/// Parse a manifest file (one or more YAML/JSON API objects, `---`-separated)
+/// into JSON object values.
+fn parse_api_documents(raw: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+    use serde::Deserialize;
+    let mut out = Vec::new();
+    for doc in serde_yaml::Deserializer::from_str(raw) {
+        let val = serde_yaml::Value::deserialize(doc).map_err(|e| anyhow::anyhow!("parse: {e}"))?;
+        if val.is_null() {
+            continue;
+        }
+        out.push(serde_json::to_value(&val).map_err(|e| anyhow::anyhow!("convert: {e}"))?);
+    }
+    Ok(out)
+}
+
+/// Extract `(kind, metadata.name)` from an API object value.
+fn object_kind_name(obj: &serde_json::Value) -> anyhow::Result<(String, String)> {
+    let kind = obj
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("object missing 'kind'"))?
+        .to_string();
+    let name = obj
+        .get("metadata")
+        .and_then(|m| m.get("name"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("{kind} object missing metadata.name"))?
+        .to_string();
+    Ok((kind, name))
+}
+
+/// Turn an object-store HTTP status into a user-facing line or error, mirroring
+/// the apiserver semantics (409 already-exists, 404 not-found).
+fn report_write(status: u16, kind: &str, name: &str, verb: &str) -> anyhow::Result<()> {
+    match status {
+        200 | 201 => {
+            println!("{kind}/{name} {verb}");
+            Ok(())
+        }
+        409 => anyhow::bail!("{kind}/{name} already exists"),
+        404 => anyhow::bail!("{kind}/{name} not found"),
+        400 => anyhow::bail!("{kind}/{name}: bad request"),
+        s => anyhow::bail!("{kind}/{name}: unexpected status {s}"),
+    }
+}
+
+/// `starling apply -f` / `starling create -f`: create-or-update (or create-only)
+/// API objects against the running instance(s)' object store.
+async fn apply_objects(args: ApplyArgs, create_only: bool) -> anyhow::Result<()> {
+    let raw = std::fs::read_to_string(&args.file)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", args.file))?;
+    let docs = parse_api_documents(&raw)?;
+    if docs.is_empty() {
+        anyhow::bail!("no API objects found in {}", args.file);
+    }
+    let client = DaemonClient::new();
+    let addrs = instance_api_addrs(&client, args.config.as_deref()).await?;
+    for addr in &addrs {
+        for obj in &docs {
+            let (kind, name) = object_kind_name(obj)?;
+            let coll = format!("/api/v1alpha1/{kind}");
+            let single = format!("/api/v1alpha1/{kind}/{name}");
+            if create_only {
+                let (status, _) = api_http(addr, "POST", &coll, Some(obj)).await?;
+                report_write(status, &kind, &name, "created")?;
+            } else {
+                // apply = replace if it exists, else create.
+                let (status, _) = api_http(addr, "PUT", &single, Some(obj)).await?;
+                if status == 404 {
+                    let (status, _) = api_http(addr, "POST", &coll, Some(obj)).await?;
+                    report_write(status, &kind, &name, "created")?;
+                } else {
+                    report_write(status, &kind, &name, "configured")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `starling patch <kind> <name> -p <json>`: RFC 7386 merge-patch.
+async fn patch_object(args: PatchArgs) -> anyhow::Result<()> {
+    let patch: serde_json::Value = serde_json::from_str(&args.patch)
+        .map_err(|e| anyhow::anyhow!("invalid --patch JSON: {e}"))?;
+    let client = DaemonClient::new();
+    let addrs = instance_api_addrs(&client, args.config.as_deref()).await?;
+    let path = format!("/api/v1alpha1/{}/{}", args.kind, args.name);
+    for addr in &addrs {
+        let (status, _) = api_http(addr, "PATCH", &path, Some(&patch)).await?;
+        report_write(status, &args.kind, &args.name, "patched")?;
+    }
+    Ok(())
+}
+
+/// `starling delete <kind> <name>`. Engine-managed objects are re-materialized
+/// on the next reload, so deleting one is transient; client-created objects
+/// (create/apply) persist until reload.
+async fn delete_object(args: DeleteArgs) -> anyhow::Result<()> {
+    let client = DaemonClient::new();
+    let addrs = instance_api_addrs(&client, args.config.as_deref()).await?;
+    let path = format!("/api/v1alpha1/{}/{}", args.kind, args.name);
+    for addr in &addrs {
+        let (status, _) = api_http(addr, "DELETE", &path, None).await?;
+        report_write(status, &args.kind, &args.name, "deleted")?;
+    }
+    Ok(())
+}
+
+/// Navigate a dotted JSON path (e.g. `status.error`) to a string value.
+fn json_path_str(obj: &serde_json::Value, path: &str) -> Option<String> {
+    let mut cur = obj;
+    for seg in path.split('.') {
+        cur = cur.get(seg)?;
+    }
+    Some(match cur {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    })
+}
+
+/// `starling wait <kind> <name> --for=<path>=<value>`: poll the object until the
+/// field at `path` equals `value` (or it exists, when no `--for` is given), or
+/// the timeout elapses.
+async fn wait_object(args: WaitArgs) -> anyhow::Result<()> {
+    let client = DaemonClient::new();
+    let addr = instance_api_addrs(&client, args.config.as_deref())
+        .await?
+        .into_iter()
+        .next()
+        .unwrap();
+    let path = format!("/api/v1alpha1/{}/{}", args.kind, args.name);
+    let (field, expected) = match args.condition.split_once('=') {
+        Some((f, v)) => (f.trim().to_string(), v.trim().to_string()),
+        None => (args.condition.trim().to_string(), String::new()),
+    };
+    let start = std::time::Instant::now();
+    loop {
+        let (status, body) = api_http(&addr, "GET", &path, None).await?;
+        if status == 200 {
+            if field.is_empty() {
+                println!("{}/{} exists", args.kind, args.name);
+                return Ok(());
+            }
+            if json_path_str(&body, &field).as_deref().unwrap_or("") == expected {
+                println!("{}/{} {field}={expected}", args.kind, args.name);
+                return Ok(());
+            }
+        }
+        if start.elapsed().as_secs() >= args.timeout {
+            anyhow::bail!(
+                "timed out after {}s waiting for {}/{} {}",
+                args.timeout,
+                args.kind,
+                args.name,
+                args.condition
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// `starling edit <kind> <name>`: fetch the object, open it in `$EDITOR`, then
+/// replace it with the edited JSON.
+async fn edit_object(args: EditArgs) -> anyhow::Result<()> {
+    let client = DaemonClient::new();
+    let addr = instance_api_addrs(&client, args.config.as_deref())
+        .await?
+        .into_iter()
+        .next()
+        .unwrap();
+    let path = format!("/api/v1alpha1/{}/{}", args.kind, args.name);
+    let (status, body) = api_http(&addr, "GET", &path, None).await?;
+    if status != 200 {
+        anyhow::bail!("{}/{} not found", args.kind, args.name);
+    }
+    let tmp = std::env::temp_dir().join(format!(
+        "starling-edit-{}-{}-{}.json",
+        args.kind,
+        args.name,
+        std::process::id()
+    ));
+    std::fs::write(&tmp, serde_json::to_string_pretty(&body)?)?;
+    let editor = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let ok = std::process::Command::new(&editor)
+        .arg(&tmp)
+        .status()
+        .map_err(|e| anyhow::anyhow!("launching {editor}: {e}"))?
+        .success();
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::bail!("editor exited non-zero; not applying");
+    }
+    let edited = std::fs::read_to_string(&tmp)?;
+    let _ = std::fs::remove_file(&tmp);
+    let obj: serde_json::Value =
+        serde_json::from_str(&edited).map_err(|e| anyhow::anyhow!("invalid edited JSON: {e}"))?;
+    let (status, _) = api_http(&addr, "PUT", &path, Some(&obj)).await?;
+    report_write(status, &args.kind, &args.name, "edited")
 }
 
 /// `starling ci`: bring the project up headless (no daemon/proxy), wait for it
@@ -2032,12 +2429,50 @@ async fn up(args: UpArgs) {
         }
     }
 
+    // API server: always bind the authoritative object-store HTTP surface so
+    // the CLI write verbs (apply/create/patch/delete/wait) can reach it. With
+    // --web it also serves the dashboard UI on the fixed --host:--port; without
+    // --web it binds an ephemeral localhost port. The bound address is reported
+    // to the daemon (below) so the CLI can discover it.
+    let api_addr: Option<String> = {
+        let state = AppState {
+            store: store.clone(),
+            csrf_token: uuid::Uuid::new_v4().to_string(),
+            api_objects: api_objects.clone(),
+        };
+        let app = server::router(state, &args.web_dir);
+        let bind = if args.web {
+            format!("{}:{}", args.host, args.port)
+        } else {
+            "127.0.0.1:0".to_string()
+        };
+        match tokio::net::TcpListener::bind(&bind).await {
+            Ok(l) => {
+                let addr = l.local_addr().ok().map(|a| a.to_string());
+                if args.web {
+                    if let Some(a) = &addr {
+                        println!("web UI on http://{a}/");
+                    }
+                }
+                tokio::spawn(async move {
+                    let _ = axum::serve(l, app).await;
+                });
+                addr
+            }
+            Err(e) => {
+                eprintln!("starling: API server bind {bind} failed: {e}");
+                None
+            }
+        }
+    };
+
     // Reporter: push state to the daemon and execute queued commands.
     if let Some((client, instance)) = daemon_instance.clone() {
         let store = store.clone();
         let port_tx = port_tx.clone();
         let shutdown_tx = shutdown_tx.clone();
         let api_objects = api_objects.clone();
+        let api_addr = api_addr.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(1000));
             // Segment count already pushed to the daemon; only newer lines go
@@ -2066,6 +2501,7 @@ async fn up(args: UpArgs) {
                         resources,
                         logs,
                         objects,
+                        api_addr: api_addr.clone(),
                     })
                     .await;
                 if let Ok(Response::Commands(cmds)) = client
@@ -2112,26 +2548,6 @@ async fn up(args: UpArgs) {
         });
     }
 
-    // Optional legacy web UI for this instance.
-    if args.web {
-        let state = AppState {
-            store: store.clone(),
-            csrf_token: uuid::Uuid::new_v4().to_string(),
-            api_objects: api_objects.clone(),
-        };
-        let app = server::router(state, &args.web_dir);
-        let addr = format!("{}:{}", args.host, args.port);
-        match tokio::net::TcpListener::bind(&addr).await {
-            Ok(l) => {
-                println!("web UI on http://{addr}/");
-                tokio::spawn(async move {
-                    let _ = axum::serve(l, app).await;
-                });
-            }
-            Err(e) => eprintln!("starling: web UI bind {addr} failed: {e}"),
-        }
-    }
-
     if args.tailscale {
         netmodes::tailscale_serve(args.proxy_port);
     }
@@ -2172,5 +2588,112 @@ mod tests {
             .contains(&"yaml"));
         assert!(api::store::spec_fields("Cmd").unwrap().contains(&"args"));
         assert!(api::store::spec_fields("NotAKind").is_none());
+    }
+
+    #[test]
+    fn parse_api_documents_handles_multidoc_and_kind_name() {
+        let raw = "apiVersion: tilt.dev/v1alpha1\nkind: FileWatch\nmetadata:\n  name: web\nspec:\n  watchedPaths: [\"./src\"]\n---\nkind: Cmd\nmetadata:\n  name: build\n";
+        let docs = parse_api_documents(raw).unwrap();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(
+            object_kind_name(&docs[0]).unwrap(),
+            ("FileWatch".into(), "web".into())
+        );
+        assert_eq!(
+            object_kind_name(&docs[1]).unwrap(),
+            ("Cmd".into(), "build".into())
+        );
+        // JSON parses too (it's a YAML subset).
+        let json = parse_api_documents("{\"kind\":\"Cmd\",\"metadata\":{\"name\":\"x\"}}").unwrap();
+        assert_eq!(
+            object_kind_name(&json[0]).unwrap(),
+            ("Cmd".into(), "x".into())
+        );
+        // Missing kind/name is an error.
+        assert!(object_kind_name(&serde_json::json!({"metadata": {"name": "a"}})).is_err());
+    }
+
+    #[test]
+    fn json_path_str_navigates_and_stringifies() {
+        let obj = serde_json::json!({"status": {"error": "", "readyPods": 2}});
+        assert_eq!(json_path_str(&obj, "status.error").as_deref(), Some(""));
+        assert_eq!(
+            json_path_str(&obj, "status.readyPods").as_deref(),
+            Some("2")
+        );
+        assert_eq!(json_path_str(&obj, "status.missing"), None);
+    }
+
+    /// End-to-end of the CLI write path against the engine's real object-store
+    /// HTTP surface (no daemon/cluster): bind `server::router`, then exercise
+    /// the `api_http` client used by apply/create/patch/delete/wait, asserting
+    /// the apiserver status codes (201/200/409/404) and store effects.
+    #[tokio::test]
+    async fn cli_write_verbs_round_trip_against_object_store() {
+        let api_objects = std::sync::Arc::new(api::store::ApiObjectStore::new());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let store = std::sync::Arc::new(store::Store::new(tx));
+        let state = AppState {
+            store,
+            csrf_token: "t".to_string(),
+            api_objects: api_objects.clone(),
+        };
+        let app = server::router(state, "web/build");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let obj = serde_json::json!({
+            "kind": "FileWatch", "metadata": {"name": "web"},
+            "spec": {"watchedPaths": ["./src"]}
+        });
+        // create (POST) -> 201; second create -> 409.
+        let (s, _) = api_http(&addr, "POST", "/api/v1alpha1/FileWatch", Some(&obj))
+            .await
+            .unwrap();
+        assert_eq!(s, 201);
+        let (s, _) = api_http(&addr, "POST", "/api/v1alpha1/FileWatch", Some(&obj))
+            .await
+            .unwrap();
+        assert_eq!(s, 409);
+        // get -> 200, reflects the spec.
+        let (s, body) = api_http(&addr, "GET", "/api/v1alpha1/FileWatch/web", None)
+            .await
+            .unwrap();
+        assert_eq!(s, 200);
+        assert_eq!(body["spec"]["watchedPaths"][0], "./src");
+        // patch (merge) -> 200; the store reflects it.
+        let (s, _) = api_http(
+            &addr,
+            "PATCH",
+            "/api/v1alpha1/FileWatch/web",
+            Some(&serde_json::json!({"spec": {"manual": true}})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s, 200);
+        assert_eq!(
+            api_objects
+                .get("FileWatch", "default", "web")
+                .unwrap()
+                .object["spec"]["manual"],
+            serde_json::json!(true)
+        );
+        // patch a missing object -> 404.
+        let (s, _) = api_http(
+            &addr,
+            "PATCH",
+            "/api/v1alpha1/FileWatch/nope",
+            Some(&serde_json::json!({"spec": {}})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s, 404);
+        // delete -> 200, then it's gone.
+        let (s, _) = api_http(&addr, "DELETE", "/api/v1alpha1/FileWatch/web", None)
+            .await
+            .unwrap();
+        assert_eq!(s, 200);
+        assert!(api_objects.get("FileWatch", "default", "web").is_none());
     }
 }

@@ -71,6 +71,11 @@ pub struct InstanceState {
     pub resources: Vec<ResourceSnapshot>,
     #[serde(default)]
     pub objects: Vec<ApiObjectSnapshot>,
+    /// `host:port` of this instance's authoritative API object store
+    /// (`/api/v1alpha1`), so the CLI can issue write verbs against it. `None`
+    /// until the instance reports it (the server binds at startup).
+    #[serde(default)]
+    pub api_addr: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -140,6 +145,9 @@ pub enum Request {
         logs: HashMap<String, Vec<String>>,
         #[serde(default)]
         objects: Vec<ApiObjectSnapshot>,
+        /// `host:port` of the instance's API object store (write-verb target).
+        #[serde(default)]
+        api_addr: Option<String>,
     },
     /// Lease a free port for a serve_cmd (avoids cross-instance conflicts).
     AllocatePort {
@@ -276,6 +284,7 @@ mod tests {
                 name: "web".to_string(),
                 object: serde_json::json!({"spec": {"args": ["echo"]}}),
             }],
+            api_addr: Some("127.0.0.1:10999".to_string()),
         };
         let wire = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&wire).unwrap();

@@ -146,8 +146,10 @@ Consequences:
   without an external reconcile call. This is the **continuous-reconciliation**
   model (vs. the one-shot `POST …/reconcile` endpoint). Verified against kind
   (section 14): the loop converges a `KubernetesDiscovery` object's `totalPods`
-  with no manual reconcile call. (Pod-log is excluded from the loop — it appends,
-  so it is not idempotent for continuous runs.)
+  with no manual reconcile call. The loop also owns **per-pod log following**
+  for `PodLogStream` objects (one follow stream per pod) — following each pod
+  exactly once is idempotent under continuous reconciliation, so pod-log is now
+  in the loop rather than excluded.
 - An in-process **kube-rs transport** (`src/kube_client.rs`, built on `kube` +
   `k8s-openapi`) is the typed alternative to shelling out to `kubectl` for pod
   listing. The pod-listing reconcilers (discovery, pod-watch, port-forward and
@@ -200,28 +202,21 @@ Consequences:
 Starling's CLI is intentionally different and daemon-first. Tilt has many CLI
 commands that Starling does not implement.
 
-Tilt top-level commands missing in Starling:
+`apply`, `create`, `patch`, `delete`, `wait`, and `edit` are now implemented
+(see section 2's CLI behavior notes); `lsp` exists as an unsupported stub. Tilt
+top-level commands still missing in Starling:
 
 - `docker`
 - `verify-install`
 - `docker-prune`
-- `edit`
-- `delete`
-- `apply`
-- `create`
-- `patch`
-- `wait`
 - `demo`
 - `analytics`
 - `alpha`
-- `lsp`
 
 Tilt subcommands missing under those commands include:
 
-- `create filewatch`
-- `create cmd`
-- `create repo`
-- `create ext`
+- `create filewatch` / `create cmd` / `create repo` / `create ext` (typed
+  constructors; the generic `create -f <file>` form covers these today)
 - `alpha tiltfile-result`
 - `alpha updog`
 - `alpha get`
@@ -247,10 +242,18 @@ Important CLI behavior gaps:
 - `starling get [kind] [name] [--json]`, `starling describe <kind> <name>`,
   `starling api-resources`, and `starling explain [kind]` are implemented: reads
   go through the daemon (the engine mirrors its object store each report tick),
-  and `explain` describes a kind's spec fields. `apply`/`delete`/`patch`/`wait`/
-  `edit` write verbs are still missing — writes are reachable over HTTP only, and
-  `delete` of an engine-managed object would be undone on the next reload anyway
-  (no reconciler owns the reverse direction yet).
+  and `explain` describes a kind's spec fields.
+- **Write verbs are implemented**: `starling apply -f`, `create -f`, `patch -p`,
+  `delete`, `wait --for=<path>=<value>`, and `edit` ($EDITOR). The engine always
+  binds its authoritative object-store API server (ephemeral localhost port when
+  `--web` is off) and reports its `api_addr` to the daemon; the CLI discovers it
+  via `GetState` and issues HTTP CRUD **directly** to the instance — a real
+  request/response path that surfaces apiserver status (`201`/`409`/`404`), which
+  the poll-based daemon command queue could not. Caveat: deleting an
+  *engine-managed* object is transient (re-materialized on the next reload);
+  client-created objects (`create`/`apply`) persist until reload. Typed
+  `create filewatch|cmd|repo|ext` constructors are not added (the `-f` file form
+  covers them).
 - `starling args [-- <args>]` replaces the running instance's Tiltfile args and
   reloads (via the daemon), equivalent to `tilt args`; `starling up -- <args>`
   sets them at launch, and `/api/set_tiltfile_args` is the web equivalent.
@@ -262,12 +265,14 @@ Important CLI behavior gaps:
 - `starling doctor` prints a diagnostic bundle (version, OS/arch, kubectl/docker
   availability, daemon health, and resources in error). It is lighter than
   `tilt doctor`'s full system probe.
-- No LSP server command.
+- `starling lsp` exists as an explicit unsupported stub (exits non-zero with a
+  message) — there is no Tiltfile language server.
 - `starling snapshot [--out file]` writes a JSON snapshot of the aggregated
   dashboard state (instances/resources/routes). There is no share/upload or
   snapshot-viewer workflow like Tilt Cloud's.
 - Tiltfile args passthrough after `--` is implemented for `starling up`,
-  `starling ci`, and live web updates, but not yet for `down`.
+  `starling ci`, live web updates, and accepted on `starling down` (down stops
+  instances by project dir, so the args don't change its behavior).
 - Many Tilt `up` flags are missing, including namespace/context-style flags,
   terminal/HUD/browser behavior, and update/debug/analytics settings.
 
@@ -443,8 +448,16 @@ Image injection gaps:
   Kubernetes YAML for `default_registry`, but does not deploy immutable
   digest-like refs.
 - `ImageMap` (and `DockerImage`/`CmdImage`) API objects are populated per built
-  image ref, but they carry no resolved digest/cluster-ref status and nothing
-  reconciles them into deploys.
+  image ref **and now carry resolved status**: each completed build records the
+  content digest (`status.imageID`, the local image ID) and the immutable deploy
+  ref (`status.image`, a content-addressed `<repo>:starling-<digest>` tag that is
+  tagged + kind-loaded). The **`KubernetesApply` reconciler injects
+  `ImageMap.status.image`** into the matching workload containers at apply time
+  (object-driven image injection, `resolve_image_maps_for` + `inject_image_maps`),
+  so a rebuild rolls the workload to a new immutable tag. Remaining: with
+  `default_registry`, injection falls back to the load-time cluster-ref rewrite
+  (the content tag is not injected when the ImageMap selector doesn't match the
+  rewritten ref).
 - `default_registry(host)` handles Tilt-style escaped registry refs, including
   `host_from_cluster` and `single_name`.
 - No registry hosting discovery.
@@ -495,9 +508,10 @@ Kubernetes gaps:
 - No object owner-reference traversal.
 - No event watching.
 - Runtime status aggregates across all matching pods (ready/total, any-failed →
-  error, readiness-ignored → ok), shown as "<ready>/<total> ready". Log
-  streaming / port-forward / initial-sync still target the first pod, and there's
-  no per-pod status list.
+  error, readiness-ignored → ok), shown as "<ready>/<total> ready". **Per-pod
+  fan-out**: log following now covers every matching pod (the controller manager
+  follows one stream per pod), and initial-sync runs once per observed pod.
+  Port-forward still targets the first pod (a local port can bind only one pod).
 - No namespace-aware deploy/status override beyond whatever `kubectl` current
   context uses.
 - `k8s_custom_deploy` creates a Kubernetes resource, runs its custom apply
@@ -541,8 +555,13 @@ Port-forward gaps:
 
 Pod/log gaps:
 
-- `kubectl logs -f --all-containers --tail 20` starts for the first observed pod
-  only.
+- Log following is now **object-driven and per-pod**: the controller manager
+  follows one `kubectl logs -f` (or typed `Api::log_stream`) per pod of each
+  `PodLogStream` object, starting a stream when a pod first appears and dropping
+  it when the pod is gone. Following each pod exactly once is what makes pod-log
+  safe under continuous reconciliation (no tail-and-append duplication), so it
+  now lives in the maintained loop. The one-shot `reconcile_pod_log_stream`
+  (tail) remains for the `POST …/reconcile` endpoint.
 - No structured per-container log status.
 - No pod source abstraction.
 - No restart-aware log stream reconciliation equivalent to Tilt.
@@ -614,9 +633,14 @@ Starling uses `notify` watchers for manifest deps and config files.
 
 Gaps:
 
-- A `FileWatch` API object is populated per resource (watched paths + ignores),
-  but it is descriptive only — file watching still runs through the engine's
-  `notify` watchers, not a `FileWatch` reconciler.
+- File watching is now **object-driven**: a FileWatch controller
+  (`spawn_file_watch_controller`) owns the `notify` watchers and starts/replaces/
+  stops them in response to `FileWatch` object add/modify/delete events. The
+  object spec is the source of truth — `watchedPaths`, `ignores`, the `manual`
+  trigger flag, and `fallbackPaths` (force-full-rebuild paths) all come from it.
+  On config reload, re-materializing the `FileWatch` objects drives the watcher
+  set via object events (no manual re-wiring; the old `watcher_generation`
+  mechanism was removed).
 - `.tiltignore` is read and applied to local resource file-change rebuilds.
 - `watch_settings(ignore=...)` is applied to local resource file-change rebuilds.
 - `local_resource(ignore=...)` is applied to that resource's file-change
@@ -633,8 +657,16 @@ manual/auto modes, and richer dependency behavior.
 
 Gaps:
 
-- No `TriggerQueue` / build-control equivalent.
-- No `StartOnSpec`, `RestartOnSpec`, or `StopOnSpec` object semantics.
+- A **`TriggerQueue`** singleton now exists: `spec.queue` is a client-writable
+  control surface (entries — plain names or `{name, nonce}` — enqueue builds via
+  the nonce-deduped `TriggerQueueReconciler`), and `status.queue` is the
+  engine-maintained view of what is currently queued to build (build-queue
+  visibility). The engine writes `status.queue` as the build loop drains its
+  coalesced batch.
+- **Crash rebuild** (Tilt's RestartOn-crash): a `serve_cmd` that exits non-zero
+  while still enabled is auto-restarted via the restart channel, with a backoff
+  that grows with the crash count and a cap (10) to avoid a tight crash loop.
+  `StartOnSpec`/`StopOnSpec` as distinct objects are still missing.
 - A disable-source `ConfigMap` (`isDisabled` = "true"/"false") is populated per
   resource and is authoritative: writing it (PATCH/PUT via the API object store)
   toggles the resource's disable state, via the engine's object-store watcher.

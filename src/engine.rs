@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -57,9 +57,6 @@ pub struct Engine {
     serve_start_counts: HashMap<String, u32>,
     /// Abort handles for running serve_cmd tasks (used to restart/kill).
     serve_tasks: HashMap<String, ServeTask>,
-    /// Incremented on config reload so stale file watcher threads stop
-    /// triggering builds for old manifests.
-    watcher_generation: Arc<AtomicU64>,
     /// Restart requests (resource names) from the dashboard.
     restart_rx: mpsc::UnboundedReceiver<String>,
     /// Live Tiltfile arg replacements from the web frontend.
@@ -77,8 +74,11 @@ pub struct Engine {
     /// Named-URL proxy handle (daemon or local); `None` disables named URLs.
     proxy: Option<crate::proxy::ProxyHandle>,
     /// Kubernetes-style API object store. Holds the declarative objects derived
-    /// from the manifests (`KubernetesApply`, `Tiltfile`, ...). The foundation
-    /// for object-backed CLI/watch; reconcilers are future work.
+    /// from the manifests (`KubernetesApply`, `ImageMap`, `FileWatch`, ...) and
+    /// is the control surface several reconcilers act on: image injection at
+    /// apply time, the FileWatch controller, the TriggerQueue, and the
+    /// maintained controller manager (discovery / pod-watch / port-forward /
+    /// pod-log following).
     api_objects: Arc<crate::api::store::ApiObjectStore>,
     /// Caps concurrent parallel local-resource updates
     /// (`update_settings(max_parallel_updates=...)`).
@@ -137,7 +137,6 @@ impl Engine {
             started_serves: HashSet::new(),
             serve_start_counts: HashMap::new(),
             serve_tasks: HashMap::new(),
-            watcher_generation: Arc::new(AtomicU64::new(0)),
             restart_rx,
             tiltfile_args_rx,
             port_rx,
@@ -315,9 +314,64 @@ impl Engine {
             .collect();
         self.reconcile_kind("ConfigMap", disable_config_maps);
 
+        // The TriggerQueue singleton. `spec.queue` is a client-writable control
+        // surface — entries enqueue builds via the TriggerQueueReconciler — and
+        // `status.queue` is the engine-maintained view of what is currently
+        // queued to build (Tilt's build-queue visibility).
+        self.api_objects.apply(
+            "TriggerQueue",
+            "default",
+            "queue",
+            serde_json::json!({ "spec": { "queue": [] }, "status": { "queue": [] } }),
+        );
+
         // The Session singleton records the run's target set.
         self.api_objects
             .apply("Session", "default", "Tiltfile", session_object(&names));
+    }
+
+    /// Record the resources currently queued to build on the `TriggerQueue`
+    /// object's status (build-queue visibility). A merge patch, so the
+    /// client-writable `spec.queue` is preserved.
+    fn set_trigger_queue_status(&self, names: &[String]) {
+        let _ = self.api_objects.patch(
+            "TriggerQueue",
+            "default",
+            "queue",
+            serde_json::json!({ "status": { "queue": names } }),
+        );
+    }
+
+    /// Record a completed build's resolved deploy ref + content digest on the
+    /// image objects. `ImageMap.status.image` is the immutable ref the
+    /// `KubernetesApply` reconciler injects into workloads at apply time
+    /// (object-driven image injection); `imageID` is the content digest.
+    fn write_image_status(&self, image_ref: &str, digest: Option<&str>, deploy_ref: &str) {
+        let image_id = digest.unwrap_or_default();
+        let _ = self.api_objects.patch(
+            "ImageMap",
+            "default",
+            image_ref,
+            serde_json::json!({ "status": { "image": deploy_ref, "imageID": image_id } }),
+        );
+        let _ = self.api_objects.patch(
+            "DockerImage",
+            "default",
+            image_ref,
+            serde_json::json!({ "status": { "ref": deploy_ref, "imageID": image_id } }),
+        );
+        if self
+            .api_objects
+            .get("CmdImage", "default", image_ref)
+            .is_some()
+        {
+            let _ = self.api_objects.patch(
+                "CmdImage",
+                "default",
+                image_ref,
+                serde_json::json!({ "status": { "ref": deploy_ref, "imageID": image_id } }),
+            );
+        }
     }
 
     /// Watch the API object store for force-trigger annotations and turn them
@@ -362,7 +416,7 @@ impl Engine {
         self.reconcile_named_ports().await;
         self.refresh_declared_services();
         self.materialize_all();
-        self.start_watchers();
+        self.spawn_file_watch_controller();
         self.spawn_api_trigger_watcher();
         // Continuously reconcile discovery/port-forward objects against the
         // cluster (maintained-controller model). Skipped in dry-run, where there
@@ -415,6 +469,9 @@ impl Engine {
                             })
                             .or_insert((force_full, changed_paths.to_vec()));
                     }
+                    // Reflect the coalesced batch on the TriggerQueue status.
+                    let queued: Vec<String> = pending.keys().cloned().collect();
+                    self.set_trigger_queue_status(&queued);
                     for (name, (force_full, changed_paths)) in pending {
                         let changed_paths = (!changed_paths.is_empty()).then_some(changed_paths);
                         if self.can_run_local_update_in_parallel(&name) {
@@ -432,6 +489,8 @@ impl Engine {
                             self.run_build(&name, force_full, changed_paths).await;
                         }
                     }
+                    // Batch drained: nothing left queued.
+                    self.set_trigger_queue_status(&[]);
                 }
                 _ = reload_rx.recv() => {
                     // Drain extra reload signals from the same save burst.
@@ -552,8 +611,10 @@ impl Engine {
             )
             .await;
         }
+        // Re-materialize updates the FileWatch objects; the FileWatch controller
+        // reacts to those object events to (re)start/stop watchers — no explicit
+        // re-wiring needed here (the object-driven path).
         self.materialize_all();
-        self.start_watchers();
         self.store.append_log(
             Some(&span),
             "INFO",
@@ -696,119 +757,42 @@ impl Engine {
             .collect()
     }
 
-    /// Watch each resource's deps; on change, enqueue a rebuild.
-    fn start_watchers(&self) {
-        let generation = self.watcher_generation.fetch_add(1, Ordering::Relaxed) + 1;
-        for m in &self.manifests {
-            if m.deps.is_empty() {
-                continue;
+    /// Spawn the **FileWatch controller**: a background task that owns the file
+    /// watchers, driven by the `FileWatch` API objects rather than wired directly
+    /// to the manifests. It starts a watcher per existing `FileWatch` object and
+    /// then reacts to the object-store event stream — (re)starting a watcher when
+    /// a `FileWatch` is added/modified (e.g. on config reload, when the
+    /// materialized object's `watchedPaths`/`ignores` change) and tearing one
+    /// down when its object is deleted. The object's spec is the source of truth:
+    /// watched paths, ignore rules, the `manual` trigger flag, and the
+    /// `fallbackPaths` that force a full rebuild all come from it.
+    fn spawn_file_watch_controller(&self) {
+        let api = self.api_objects.clone();
+        let store = self.store.clone();
+        let build_tx = self.build_tx.clone();
+        let mut watch = api.watch();
+        tokio::spawn(async move {
+            use crate::api::store::ObjectEvent;
+            // object name -> stop flag for the watcher thread we own for it.
+            let mut handles: HashMap<String, Arc<AtomicBool>> = HashMap::new();
+            // Initial sync: start a watcher for every materialized FileWatch.
+            for obj in api.list("FileWatch") {
+                start_file_watch(&obj.name, &obj.object, &build_tx, &store, &mut handles);
             }
-            let name = m.name.clone();
-            let tx = self.build_tx.clone();
-            let store = self.store.clone();
-            let deps = m.deps.clone();
-            let ignore_rules = m.ignore_rules.clone();
-            let fallback_paths = live_update_fallback_paths(m);
-            let watcher_generation = self.watcher_generation.clone();
-            // Manual trigger modes only mark pending changes; they don't build.
-            let auto_on_change = m.auto_on_change();
-            // Each watcher runs on a blocking thread; notify delivers events to
-            // a std channel we forward as build requests.
-            std::thread::spawn(move || {
-                let (raw_tx, raw_rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
-                let mut watcher = match notify::recommended_watcher(move |res| {
-                    let _ = raw_tx.send(res);
-                }) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        store.append_log(
-                            Some(&name),
-                            "ERROR",
-                            &format!("failed to create file watcher: {e}\n"),
-                        );
-                        return;
+            while let Ok(event) = watch.recv().await {
+                match event {
+                    ObjectEvent::Added(o) | ObjectEvent::Modified(o) if o.kind == "FileWatch" => {
+                        start_file_watch(&o.name, &o.object, &build_tx, &store, &mut handles);
                     }
-                };
-                for dep in &deps {
-                    let mode = if dep.is_dir() {
-                        RecursiveMode::Recursive
-                    } else {
-                        RecursiveMode::NonRecursive
-                    };
-                    if let Err(e) = watcher.watch(dep, mode) {
-                        store.append_log(
-                            Some(&name),
-                            "WARN",
-                            &format!("can't watch {}: {e}\n", dep.display()),
-                        );
-                    }
-                }
-                // Debounce file events: collect a burst, then enqueue once.
-                while let Ok(first) = raw_rx.recv() {
-                    if !is_content_event(&first) {
-                        continue;
-                    }
-                    let mut changed_paths = event_paths(&first);
-                    while let Ok(ev) = raw_rx.recv_timeout(Duration::from_millis(200)) {
-                        if is_content_event(&ev) {
-                            changed_paths.extend(event_paths(&ev));
+                    ObjectEvent::Deleted(o) if o.kind == "FileWatch" => {
+                        if let Some(stop) = handles.remove(&o.name) {
+                            stop.store(true, Ordering::Relaxed);
                         }
                     }
-                    if watcher_generation.load(Ordering::Relaxed) != generation {
-                        break;
-                    }
-                    if !changed_paths.is_empty()
-                        && changed_paths
-                            .iter()
-                            .all(|path| is_ignored_by_rules(path, &ignore_rules))
-                    {
-                        store.append_log(
-                            Some(&name),
-                            "INFO",
-                            "Ignored file change matched ignore rules\n",
-                        );
-                        continue;
-                    }
-                    store.append_log(Some(&name), "INFO", "Detected file change\n");
-                    let force_full = changed_paths
-                        .iter()
-                        .any(|path| matches_any_path(path, &fallback_paths));
-                    if store.is_resource_disabled(&name) {
-                        store.update_status(&name, |st| {
-                            st.has_pending_changes = Some(true);
-                            st.pending_build_since = Some(chrono::Utc::now().to_rfc3339());
-                        });
-                        store.append_log(
-                            Some(&name),
-                            "INFO",
-                            "Resource is paused; live reload skipped\n",
-                        );
-                        continue;
-                    }
-                    if auto_on_change {
-                        let request = if force_full {
-                            store.append_log(
-                                Some(&name),
-                                "INFO",
-                                "File change matched fall_back_on; forcing full rebuild\n",
-                            );
-                            BuildRequest::force_full_request(name.clone(), changed_paths.clone())
-                        } else {
-                            BuildRequest::auto(name.clone(), changed_paths.clone())
-                        };
-                        if tx.send(request).is_err() {
-                            break;
-                        }
-                    } else {
-                        // Manual mode: mark pending instead of building.
-                        store.update_status(&name, |st| {
-                            st.has_pending_changes = Some(true);
-                            st.pending_build_since = Some(chrono::Utc::now().to_rfc3339());
-                        });
-                    }
+                    _ => {}
                 }
-            });
-        }
+            }
+        });
     }
 
     /// Spawn a long-running serve command and reflect its runtime status.
@@ -981,6 +965,34 @@ impl Engine {
                         if ok { "INFO" } else { "ERROR" },
                         &format!("serve_cmd exited (ok={ok})\n"),
                     );
+                    // Crash rebuild (Tilt's RestartOn-crash): a serve that exits
+                    // non-zero while still enabled is restarted, with a backoff
+                    // that grows with the crash count and a cap so a serve that
+                    // crashes immediately and repeatedly doesn't loop forever.
+                    if !ok && !store.is_resource_disabled(&name) {
+                        const MAX_CRASH_RESTARTS: u32 = 10;
+                        if restart_count < MAX_CRASH_RESTARTS {
+                            let backoff =
+                                Duration::from_secs(2 * (restart_count as u64 + 1).min(8));
+                            tokio::time::sleep(backoff).await;
+                            if !store.is_resource_disabled(&name) {
+                                store.append_log(
+                                    Some(&name),
+                                    "INFO",
+                                    "serve_cmd crashed; restarting (crash rebuild)\n",
+                                );
+                                let _ = store.restart(&name);
+                            }
+                        } else {
+                            store.append_log(
+                                Some(&name),
+                                "ERROR",
+                                &format!(
+                                    "serve_cmd crashed {MAX_CRASH_RESTARTS} times; giving up on crash rebuild\n"
+                                ),
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     store.update_status(&name, |st| {
@@ -1271,7 +1283,7 @@ impl Engine {
         });
 
         let mut error: Option<String> = None;
-        let mut apply_docs = m.k8s_apply_docs.clone();
+        let apply_docs = m.k8s_apply_docs.clone();
 
         // 1. Build images via the native Docker API (bollard), then load them
         //    into a kind cluster if that's where we're deploying.
@@ -1282,18 +1294,32 @@ impl Engine {
                 &format!("Building image: {}\n", db.image_ref),
             );
             match build_image(db, &self.store, &span).await {
-                Ok(output_ref) => {
-                    if let Some(output_ref) = output_ref {
-                        for doc in &mut apply_docs {
-                            *doc = starlingfile::rewrite_container_image(
-                                doc,
-                                &db.image_ref,
-                                &output_ref,
-                            );
+                Ok(result) => {
+                    // Resolve the immutable ref to deploy: a custom_build's reported
+                    // output ref, else a content-addressed tag derived from the
+                    // build digest, else the declared ref (no digest available).
+                    let deploy_ref = if let Some(output_ref) = &result.output_ref {
+                        output_ref.clone()
+                    } else if let Some(digest) = &result.digest {
+                        content_addressed_ref(&db.image_ref, digest)
+                    } else {
+                        db.image_ref.clone()
+                    };
+                    // Tag the freshly built image with the content ref so the
+                    // cluster pulls exactly this build (skip for custom_build,
+                    // which controls its own tags, and when the ref is unchanged).
+                    if result.output_ref.is_none() && deploy_ref != db.image_ref && !self.dry_run {
+                        if let Err(e) = tag_image(&db.image_ref, &deploy_ref).await {
+                            self.store
+                                .append_log(Some(&span), "WARN", &format!("{e}\n"));
                         }
                     }
+                    // Record the resolved ref + digest on the image objects; the
+                    // KubernetesApply reconciler injects ImageMap.status.image into
+                    // the workload at apply time (object-driven image injection).
+                    self.write_image_status(&db.image_ref, result.digest.as_deref(), &deploy_ref);
                     if !self.dry_run && !db.skips_local_docker {
-                        kind_load(&db.image_ref, &self.store, &span).await;
+                        kind_load(&deploy_ref, &self.store, &span).await;
                     }
                 }
                 Err(e) => error = Some(e),
@@ -1322,7 +1348,11 @@ impl Engine {
             let docs = apply_docs.join("\n---\n");
             if self.dry_run {
                 // Client-side only: no API calls, nothing mutated. `--validate=false`
-                // avoids the openapi fetch so it works fully offline.
+                // avoids the openapi fetch so it works fully offline. Inject the
+                // resolved ImageMap refs inline so the dry-run reflects the same
+                // image injection the reconciler does for real deploys.
+                let maps = resolve_image_maps_for(&self.api_objects, name);
+                let docs = inject_image_maps(&docs, &maps);
                 let argv = vec![
                     "kubectl".to_string(),
                     "apply".to_string(),
@@ -1339,9 +1369,11 @@ impl Engine {
                     Err(e) => error = Some(e),
                 }
             } else {
-                // Authoritative path: publish the final (post-build-rewrite) YAML
-                // to the KubernetesApply object, then let the reconciler apply it.
-                self.api_objects.apply(
+                // Authoritative path: publish the final YAML to the KubernetesApply
+                // object (a merge patch, so the materialized `spec.imageMaps` list
+                // survives), then let the reconciler resolve + inject the ImageMap
+                // refs and apply it.
+                let _ = self.api_objects.patch(
                     "KubernetesApply",
                     "default",
                     name,
@@ -1554,8 +1586,11 @@ impl Engine {
             .collect::<Vec<_>>()
             .join(",");
         tokio::spawn(async move {
-            let mut streaming_pod: Option<String> = None;
-            let mut initial_synced_pod: Option<String> = None;
+            // Initial-sync is fanned out across every observed pod (each replica
+            // gets the startup sync once). Log streaming is owned by the
+            // controller manager (per-pod follow). Port-forward targets the first
+            // pod, since a local port can bind only one pod.
+            let mut initial_synced_pods: HashSet<String> = HashSet::new();
             let mut port_forward_pod: Option<String> = None;
             let mut port_forward_tasks: Vec<tokio::task::JoinHandle<()>> = vec![];
             loop {
@@ -1571,8 +1606,8 @@ impl Engine {
                     let items = json["items"].as_array().unwrap_or(&empty);
                     let summary = aggregate_pod_status(items, readiness_ignored);
                     if let Some(pod) = items.first() {
-                        // Downstream log/sync/port-forward wiring still targets the
-                        // first pod; status reflects the whole pod set.
+                        // Status reflects the whole pod set; the first pod's name
+                        // is shown as the representative pod.
                         let pod_name = pod["metadata"]["name"].as_str().unwrap_or("").to_string();
                         store.update_status(&name, |st| {
                             st.runtime_status = Some(summary.runtime.to_string());
@@ -1585,28 +1620,32 @@ impl Engine {
                                 ..Default::default()
                             });
                         });
-                        // Start streaming logs once, for the first live pod.
-                        if streaming_pod.as_deref() != Some(pod_name.as_str())
-                            && !pod_name.is_empty()
-                        {
-                            streaming_pod = Some(pod_name.clone());
-                            stream_pod_logs(pod_name.clone(), name.clone(), store.clone());
-                        }
-                        if live_update_has_initial_sync(&live_update)
-                            && initial_synced_pod.as_deref() != Some(pod_name.as_str())
-                            && !pod_name.is_empty()
-                        {
-                            initial_synced_pod = Some(pod_name.clone());
+                    }
+                    // Initial sync: once per observed pod (per-pod fan-out).
+                    if live_update_has_initial_sync(&live_update) {
+                        for pod in items {
+                            let pn = pod["metadata"]["name"].as_str().unwrap_or("").to_string();
+                            if pn.is_empty() || initial_synced_pods.contains(&pn) {
+                                continue;
+                            }
+                            initial_synced_pods.insert(pn.clone());
                             tokio::spawn(run_initial_sync(
                                 store.clone(),
                                 name.clone(),
-                                pod_name.clone(),
+                                pn,
                                 live_update.clone(),
                             ));
                         }
-                        if !port_forwards.is_empty()
+                    }
+                    // Port-forward: (re)bind to the first pod when it changes.
+                    if !port_forwards.is_empty() {
+                        let pod_name = items
+                            .first()
+                            .and_then(|p| p["metadata"]["name"].as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !pod_name.is_empty()
                             && port_forward_pod.as_deref() != Some(pod_name.as_str())
-                            && !pod_name.is_empty()
                         {
                             for task in port_forward_tasks.drain(..) {
                                 task.abort();
@@ -1763,11 +1802,68 @@ async fn build_image_buildkit(
     }
 }
 
+/// The outcome of building a single image. `output_ref` is the rewritten ref a
+/// `custom_build` reported via `outputs_image_ref_to` (else None). `digest` is
+/// the locally-resolved immutable image ID (`sha256:...`) when it could be
+/// inspected — the content identity used to derive an immutable deploy ref and
+/// recorded on the `ImageMap`/`DockerImage` object status.
+#[derive(Debug, Default, Clone)]
+struct BuildResult {
+    output_ref: Option<String>,
+    digest: Option<String>,
+}
+
+/// Inspect a locally-available image and return its content image ID
+/// (`sha256:...`). Returns None if the daemon/image is unavailable — callers
+/// degrade to a non-digest deploy ref rather than failing the build.
+async fn inspect_image_id(image_ref: &str) -> Option<String> {
+    let docker = bollard::Docker::connect_with_local_defaults().ok()?;
+    docker.inspect_image(image_ref).await.ok()?.id
+}
+
+/// Extract a `@sha256:...` digest already embedded in an image ref, if present
+/// (e.g. a `custom_build` script that emits a digest-pinned ref).
+fn digest_from_ref(image_ref: &str) -> Option<String> {
+    image_ref
+        .split_once('@')
+        .map(|(_, d)| d.to_string())
+        .filter(|d| d.starts_with("sha256:"))
+}
+
+/// A short, deterministic tag derived from an image's content digest, so each
+/// distinct build produces a distinct immutable tag (and an unchanged build
+/// reuses it). Mirrors Tilt's content-addressed `tilt-<hash>` deploy tags.
+fn immutable_image_tag(digest: &str) -> String {
+    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+    format!("starling-{}", &hex[..hex.len().min(12)])
+}
+
+/// The immutable, content-addressed ref to deploy for a build: the build repo
+/// with a digest-derived tag. Reusing the repo keeps it pullable from the same
+/// place (kind-loaded or local), while the tag rolls the workload on any change.
+fn content_addressed_ref(image_ref: &str, digest: &str) -> String {
+    let (repo, _) = image_ref_repo_and_tag(image_ref);
+    format!("{repo}:{}", immutable_image_tag(digest))
+}
+
+/// Tag an already-built `source` image as `target` via the Docker daemon, so the
+/// immutable content ref resolves to the freshly built image.
+async fn tag_image(source: &str, target: &str) -> Result<(), String> {
+    use bollard::image::TagImageOptions;
+    let docker = bollard::Docker::connect_with_local_defaults()
+        .map_err(|e| format!("connecting to Docker daemon: {e}"))?;
+    let (repo, tag) = image_ref_repo_and_tag(target);
+    docker
+        .tag_image(source, Some(TagImageOptions { repo, tag }))
+        .await
+        .map_err(|e| format!("tagging {source} as {target}: {e}"))
+}
+
 async fn build_image(
     db: &crate::starlingfile::DockerBuild,
     store: &Arc<Store>,
     span: &str,
-) -> Result<Option<String>, String> {
+) -> Result<BuildResult, String> {
     use bollard::image::TagImageOptions;
     use futures::StreamExt;
 
@@ -1783,7 +1879,7 @@ async fn build_image(
         cmd.env.push(("TAG".to_string(), expected_tag));
         return match run_to_completion(&cmd, store, span).await {
             Ok(true) => {
-                if let Some(path) = &db.outputs_image_ref_to {
+                let output_ref = if let Some(path) = &db.outputs_image_ref_to {
                     let text = tokio::fs::read_to_string(path).await.map_err(|e| {
                         format!(
                             "custom_build {} could not read outputs_image_ref_to {}: {e}",
@@ -1804,10 +1900,19 @@ async fn build_image(
                         "INFO",
                         &format!("custom_build output image ref: {output_ref}\n"),
                     );
-                    Ok(Some(output_ref))
+                    Some(output_ref)
                 } else {
-                    Ok(None)
-                }
+                    None
+                };
+                // Prefer a digest already pinned in the output ref; otherwise try
+                // to inspect the built image locally (it may not be present when
+                // the script pushed directly, in which case digest stays None).
+                let inspect_target = output_ref.as_deref().unwrap_or(&db.image_ref);
+                let digest = match digest_from_ref(inspect_target) {
+                    Some(d) => Some(d),
+                    None => inspect_image_id(inspect_target).await,
+                };
+                Ok(BuildResult { output_ref, digest })
             }
             Ok(false) => Err(format!("custom_build {} command failed", db.image_ref)),
             Err(e) => Err(e),
@@ -1818,7 +1923,12 @@ async fn build_image(
     // no BuildKit session. Route those builds through the `docker build` CLI,
     // which uses BuildKit and supports --secret/--ssh/--cache-from passthrough.
     if !db.ssh.is_empty() || !db.secrets.is_empty() {
-        return build_image_buildkit(db, store, span).await.map(|_| None);
+        build_image_buildkit(db, store, span).await?;
+        let digest = inspect_image_id(&db.image_ref).await;
+        return Ok(BuildResult {
+            output_ref: None,
+            digest,
+        });
     }
 
     let docker = bollard::Docker::connect_with_local_defaults()
@@ -1868,7 +1978,11 @@ async fn build_image(
             &format!("Tagged {} as {extra_tag}\n", db.image_ref),
         );
     }
-    Ok(None)
+    let digest = inspect_image_id(&db.image_ref).await;
+    Ok(BuildResult {
+        output_ref: None,
+        digest,
+    })
 }
 
 fn custom_build_expected_ref(db: &crate::starlingfile::DockerBuild) -> String {
@@ -2126,6 +2240,63 @@ async fn kubectl_apply_yaml(yaml: &str, delete: bool) -> Result<(), String> {
 /// loop) and write the apply result onto the object's `status`. This is a real
 /// cluster-backed reconciler; it is exercised by the gated k8s integration test
 /// and is the basis for making the object store the authoritative apply path.
+/// Collect the `(selector, resolved-image)` pairs for the ImageMaps a
+/// `KubernetesApply` references. Reads each ImageMap's `spec.selector` (the
+/// Tiltfile image the workload uses) and `status.image` (the immutable deploy
+/// ref a completed build recorded). ImageMaps with no resolved image yet are
+/// skipped, so a not-yet-built image leaves the workload's ref untouched.
+fn resolve_image_maps_for(
+    api: &Arc<crate::api::store::ApiObjectStore>,
+    apply_name: &str,
+) -> Vec<(String, String)> {
+    let Some(obj) = api.get("KubernetesApply", "default", apply_name) else {
+        return Vec::new();
+    };
+    let names = obj.object["spec"]["imageMaps"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut maps = Vec::new();
+    for name in names {
+        let Some(name) = name.as_str() else { continue };
+        let Some(im) = api.get("ImageMap", "default", name) else {
+            continue;
+        };
+        let selector = im.object["spec"]["selector"]
+            .as_str()
+            .unwrap_or(name)
+            .to_string();
+        let image = im.object["status"]["image"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if !image.is_empty() {
+            maps.push((selector, image));
+        }
+    }
+    maps
+}
+
+/// Rewrite each document's matching container images to the resolved ImageMap
+/// refs. Multi-doc YAML is split on the `\n---\n` joiner the engine uses, each
+/// document rewritten, then rejoined (matching `rewrite_container_image`'s
+/// single-document contract).
+fn inject_image_maps(yaml: &str, maps: &[(String, String)]) -> String {
+    if maps.is_empty() {
+        return yaml.to_string();
+    }
+    yaml.split("\n---\n")
+        .map(|doc| {
+            let mut d = doc.to_string();
+            for (selector, image) in maps {
+                d = crate::starlingfile::rewrite_container_image(&d, selector, image);
+            }
+            d
+        })
+        .collect::<Vec<_>>()
+        .join("\n---\n")
+}
+
 pub async fn reconcile_kubernetes_apply(
     api: &Arc<crate::api::store::ApiObjectStore>,
     name: &str,
@@ -2140,6 +2311,10 @@ pub async fn reconcile_kubernetes_apply(
     if yaml.trim().is_empty() {
         return Err(format!("KubernetesApply {name} has no spec.yaml to apply"));
     }
+    // Resolve + inject the immutable ImageMap refs into the workloads (the
+    // object-driven image-injection step Tilt's apply controller performs).
+    let maps = resolve_image_maps_for(api, name);
+    let yaml = inject_image_maps(&yaml, &maps);
     let result = if crate::kube_client::use_kube_rs() {
         crate::kube_client::apply_yaml(&yaml).await
     } else {
@@ -2337,8 +2512,16 @@ impl Drop for ForwardProcesses {
 /// `status.podName`: starts the forwards when a target first appears, restarts
 /// them when the target pod changes, and tears them down (via `ForwardProcesses`'
 /// `Drop`) when the object is deleted. This is the long-lived process lifecycle
-/// moved into the controller. (Pod-log is excluded from the status reconcilers:
-/// it appends, so it's not idempotent for continuous runs.)
+/// moved into the controller.
+///
+/// It also owns **pod-log following**: for each `PodLogStream` object it follows
+/// every matching pod's logs (one follow stream per pod — per-pod fan-out),
+/// starting a stream when a pod first appears and dropping it when the pod is
+/// gone. Following each pod exactly once is what makes pod-log safe under
+/// continuous reconciliation (the reason it was previously excluded from the
+/// loop: a tail-and-append reconcile duplicates lines; a per-pod follow does
+/// not). The one-shot `reconcile_pod_log_stream` (tail) remains for the
+/// `POST …/reconcile` endpoint.
 pub fn spawn_controller_manager(
     api: Arc<crate::api::store::ApiObjectStore>,
     store: Arc<Store>,
@@ -2348,11 +2531,45 @@ pub fn spawn_controller_manager(
     tokio::spawn(async move {
         // object name -> the forward processes we own for it.
         let mut forwards: HashMap<String, ForwardProcesses> = HashMap::new();
+        // pod name -> the follow-log task we own for it.
+        let mut log_follows: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
         loop {
             for obj in api.list("KubernetesDiscovery") {
                 let _ = reconcile_kubernetes_discovery(&api, &obj.name).await;
                 let _ = reconcile_pod_watch(&api, &obj.name).await;
             }
+
+            // Follow logs for every pod of every PodLogStream (per-pod fan-out).
+            let mut live_log_pods: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for obj in api.list("PodLogStream") {
+                let selector = pod_log_selector(&obj.object);
+                if selector.is_empty() {
+                    continue;
+                }
+                let pods = list_pods_for_selector(&selector).await.unwrap_or_default();
+                for p in &pods {
+                    let pod = p["metadata"]["name"].as_str().unwrap_or("").to_string();
+                    if pod.is_empty() {
+                        continue;
+                    }
+                    live_log_pods.insert(pod.clone());
+                    // Start a follow stream the first time we see this pod; logs
+                    // go to the resource span (the PodLogStream object's name).
+                    log_follows.entry(pod.clone()).or_insert_with(|| {
+                        stream_pod_logs(pod.clone(), obj.name.clone(), store.clone())
+                    });
+                }
+            }
+            // Stop following pods that no longer exist.
+            log_follows.retain(|pod, handle| {
+                let live = live_log_pods.contains(pod);
+                if !live {
+                    handle.abort();
+                }
+                live
+            });
+
             let pf_objects = api.list("PortForward");
             let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
             for obj in &pf_objects {
@@ -2567,9 +2784,24 @@ pub async fn reconcile_live_update(
     }
 }
 
+/// Build a `key=value,...` label selector string from an object's
+/// `spec.selector.matchLabels`.
+fn pod_log_selector(object: &serde_json::Value) -> String {
+    object["spec"]["selector"]["matchLabels"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default()
+}
+
 /// Reconcile a `PodLogStream` object: fetch recent logs for its selector and
 /// append them to the store under the resource span, recording the line count
-/// on the object — the pod-log controller, object-driven and cluster-backed.
+/// on the object — the one-shot pod-log reconcile behind `POST …/reconcile`.
+/// Continuous following is owned by the controller manager (per-pod follow).
 pub async fn reconcile_pod_log_stream(
     api: &Arc<crate::api::store::ApiObjectStore>,
     store: &Arc<Store>,
@@ -2748,20 +2980,20 @@ fn aggregate_pod_status(items: &[serde_json::Value], readiness_ignored: bool) ->
 }
 
 /// Stream a pod's logs (`kubectl logs -f`) into the resource span.
-fn stream_pod_logs(pod: String, span: String, store: Arc<Store>) {
+fn stream_pod_logs(pod: String, span: String, store: Arc<Store>) -> tokio::task::JoinHandle<()> {
     // Typed `Api::log_stream` follow under kube-rs, else `kubectl logs -f`.
     if crate::kube_client::use_kube_rs() {
-        tokio::spawn(async move {
+        return tokio::spawn(async move {
             match crate::kube_client::log_stream(&pod, 20).await {
                 Ok(reader) => stream_lines(reader, store, span, "INFO", None),
                 Err(e) => store.append_log(Some(&span), "ERROR", &format!("log stream: {e}\n")),
             }
         });
-        return;
     }
     tokio::spawn(async move {
         let mut child = match Command::new("kubectl")
             .args(["logs", "-f", "--all-containers", "--tail", "20", &pod])
+            .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -2773,7 +3005,7 @@ fn stream_pod_logs(pod: String, span: String, store: Arc<Store>) {
             stream_lines(out, store, span, "INFO", None);
         }
         let _ = child.wait().await;
-    });
+    })
 }
 
 fn port_forward_args(pod: &str, spec: &PortForwardSpec) -> Vec<String> {
@@ -2932,7 +3164,11 @@ fn tiltfile_object(path: &Path, resource_names: &[String]) -> serde_json::Value 
 }
 
 /// Build a `FileWatch` API object from a manifest's watched deps + ignore rules,
-/// mirroring the slice of Tilt's `FileWatchSpec` Starling populates.
+/// mirroring the slice of Tilt's `FileWatchSpec` Starling populates. The object
+/// is the source of truth the FileWatch controller starts watchers from, so it
+/// also carries the trigger behavior: `manual` (file changes mark pending
+/// instead of building) and `fallbackPaths` (changes that force a full rebuild
+/// rather than a live update).
 fn file_watch_object(m: &Manifest) -> serde_json::Value {
     let watched: Vec<String> = m.deps.iter().map(|p| p.display().to_string()).collect();
     let ignores: Vec<serde_json::Value> = m
@@ -2945,7 +3181,18 @@ fn file_watch_object(m: &Manifest) -> serde_json::Value {
             })
         })
         .collect();
-    serde_json::json!({ "spec": { "watchedPaths": watched, "ignores": ignores } })
+    let fallback_paths: Vec<String> = live_update_fallback_paths(m)
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    serde_json::json!({
+        "spec": {
+            "watchedPaths": watched,
+            "ignores": ignores,
+            "manual": !m.auto_on_change(),
+            "fallbackPaths": fallback_paths,
+        }
+    })
 }
 
 /// Build a `PortForward` API object from a Kubernetes resource's port forwards,
@@ -3168,11 +3415,55 @@ impl Reconciler for DisableConfigMapReconciler {
     }
 }
 
+/// A `TriggerQueue` write enqueues builds for the resources in `spec.queue`.
+/// Entries are plain names or `{name, nonce}` objects; a fresh `nonce` lets the
+/// same resource be re-triggered (without one, a name triggers once per engine
+/// lifetime). Dedupe is by `name:nonce`, so the engine's own `status.queue`
+/// writes — which re-emit the object — don't re-fire builds.
+struct TriggerQueueReconciler {
+    seen: Mutex<HashSet<String>>,
+}
+impl Reconciler for TriggerQueueReconciler {
+    fn reconcile(&self, event: &crate::api::store::ObjectEvent, store: &Arc<Store>) {
+        use crate::api::store::ObjectEvent;
+        let stored = match event {
+            ObjectEvent::Added(o) | ObjectEvent::Modified(o) => o,
+            ObjectEvent::Deleted(_) => return,
+        };
+        if stored.kind != "TriggerQueue" {
+            return;
+        }
+        let Some(queue) = stored.object["spec"]["queue"].as_array() else {
+            return;
+        };
+        let mut seen = self.seen.lock().unwrap();
+        for entry in queue {
+            let (name, nonce) = match entry {
+                serde_json::Value::String(s) => (s.clone(), String::new()),
+                serde_json::Value::Object(_) => (
+                    entry["name"].as_str().unwrap_or("").to_string(),
+                    entry["nonce"].as_str().unwrap_or("").to_string(),
+                ),
+                _ => continue,
+            };
+            if name.is_empty() {
+                continue;
+            }
+            if seen.insert(format!("{name}:{nonce}")) {
+                let _ = store.trigger(&name);
+            }
+        }
+    }
+}
+
 /// The reconcilers the engine runs against its API object store.
 fn default_reconcilers() -> Reconcilers {
     let mut r = Reconcilers::new();
     r.register(Box::new(ForceTriggerReconciler));
     r.register(Box::new(DisableConfigMapReconciler));
+    r.register(Box::new(TriggerQueueReconciler {
+        seen: Mutex::new(HashSet::new()),
+    }));
     r
 }
 
@@ -3505,6 +3796,191 @@ impl ServeRouteMonitor {
             );
         }
     }
+}
+
+/// Reconstruct the ignore rules recorded on a `FileWatch` object's
+/// `spec.ignores` (each `{ basePath, patterns: [...] }`).
+fn parse_ignore_rules(value: &serde_json::Value) -> Vec<IgnoreRule> {
+    let mut rules = Vec::new();
+    let Some(arr) = value.as_array() else {
+        return rules;
+    };
+    for r in arr {
+        let base = PathBuf::from(r["basePath"].as_str().unwrap_or(""));
+        if let Some(patterns) = r["patterns"].as_array() {
+            for p in patterns {
+                if let Some(p) = p.as_str() {
+                    rules.push(IgnoreRule {
+                        base: base.clone(),
+                        pattern: p.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    rules
+}
+
+/// (Re)start the file watcher for a `FileWatch` object, reading its watched
+/// paths / ignores / trigger behavior from the object spec. Any watcher already
+/// running for this object name is stopped first (its spec may have changed).
+fn start_file_watch(
+    name: &str,
+    object: &serde_json::Value,
+    build_tx: &mpsc::UnboundedSender<BuildRequest>,
+    store: &Arc<Store>,
+    handles: &mut HashMap<String, Arc<AtomicBool>>,
+) {
+    if let Some(prev) = handles.remove(name) {
+        prev.store(true, Ordering::Relaxed);
+    }
+    let spec = &object["spec"];
+    let watched: Vec<PathBuf> = spec["watchedPaths"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    if watched.is_empty() {
+        return;
+    }
+    let ignore_rules = parse_ignore_rules(&spec["ignores"]);
+    let fallback_paths: Vec<PathBuf> = spec["fallbackPaths"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let manual = spec["manual"].as_bool().unwrap_or(false);
+    let stop = Arc::new(AtomicBool::new(false));
+    handles.insert(name.to_string(), stop.clone());
+    spawn_notify_watcher(
+        name.to_string(),
+        watched,
+        ignore_rules,
+        fallback_paths,
+        manual,
+        build_tx.clone(),
+        store.clone(),
+        stop,
+    );
+}
+
+/// Run the notify watcher for one `FileWatch` on a blocking thread, forwarding
+/// debounced content changes as build requests. Exits when `stop` is set (the
+/// controller stops/replaces the watcher) — checked after each debounce so a
+/// replaced watcher yields to its successor without a duplicate build.
+#[allow(clippy::too_many_arguments)]
+fn spawn_notify_watcher(
+    name: String,
+    deps: Vec<PathBuf>,
+    ignore_rules: Vec<IgnoreRule>,
+    fallback_paths: Vec<PathBuf>,
+    manual: bool,
+    tx: mpsc::UnboundedSender<BuildRequest>,
+    store: Arc<Store>,
+    stop: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let (raw_tx, raw_rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
+        let mut watcher = match notify::recommended_watcher(move |res| {
+            let _ = raw_tx.send(res);
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                store.append_log(
+                    Some(&name),
+                    "ERROR",
+                    &format!("failed to create file watcher: {e}\n"),
+                );
+                return;
+            }
+        };
+        for dep in &deps {
+            let mode = if dep.is_dir() {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
+            if let Err(e) = watcher.watch(dep, mode) {
+                store.append_log(
+                    Some(&name),
+                    "WARN",
+                    &format!("can't watch {}: {e}\n", dep.display()),
+                );
+            }
+        }
+        // Debounce file events: collect a burst, then enqueue once.
+        while let Ok(first) = raw_rx.recv() {
+            if !is_content_event(&first) {
+                continue;
+            }
+            let mut changed_paths = event_paths(&first);
+            while let Ok(ev) = raw_rx.recv_timeout(Duration::from_millis(200)) {
+                if is_content_event(&ev) {
+                    changed_paths.extend(event_paths(&ev));
+                }
+            }
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if !changed_paths.is_empty()
+                && changed_paths
+                    .iter()
+                    .all(|path| is_ignored_by_rules(path, &ignore_rules))
+            {
+                store.append_log(
+                    Some(&name),
+                    "INFO",
+                    "Ignored file change matched ignore rules\n",
+                );
+                continue;
+            }
+            store.append_log(Some(&name), "INFO", "Detected file change\n");
+            let force_full = changed_paths
+                .iter()
+                .any(|path| matches_any_path(path, &fallback_paths));
+            if store.is_resource_disabled(&name) {
+                store.update_status(&name, |st| {
+                    st.has_pending_changes = Some(true);
+                    st.pending_build_since = Some(chrono::Utc::now().to_rfc3339());
+                });
+                store.append_log(
+                    Some(&name),
+                    "INFO",
+                    "Resource is paused; live reload skipped\n",
+                );
+                continue;
+            }
+            if !manual {
+                let request = if force_full {
+                    store.append_log(
+                        Some(&name),
+                        "INFO",
+                        "File change matched fall_back_on; forcing full rebuild\n",
+                    );
+                    BuildRequest::force_full_request(name.clone(), changed_paths.clone())
+                } else {
+                    BuildRequest::auto(name.clone(), changed_paths.clone())
+                };
+                if tx.send(request).is_err() {
+                    break;
+                }
+            } else {
+                // Manual mode: mark pending instead of building.
+                store.update_status(&name, |st| {
+                    st.has_pending_changes = Some(true);
+                    st.pending_build_since = Some(chrono::Utc::now().to_rfc3339());
+                });
+            }
+        }
+    });
 }
 
 /// True for events that represent content/metadata changes worth rebuilding on.
@@ -4372,6 +4848,105 @@ data:
             "reconciler did not apply the ConfigMap to the cluster"
         );
         assert!(status_ok, "reconciler did not record success on the object");
+    }
+
+    /// Apply-time image injection: a `KubernetesApply` referencing an `ImageMap`
+    /// has its workload image rewritten to the ImageMap's resolved
+    /// `status.image` before being applied — the object-driven image-injection
+    /// path, verified end-to-end. The placeholder image (`example/...`) is never
+    /// deployed; the pod runs the resolved, pullable ref. Gated
+    /// (`STARLING_K8S_IT=1` + `kind-*`).
+    #[tokio::test]
+    #[ignore]
+    async fn k8s_integration_apply_injects_image_map() {
+        use std::process::Command;
+
+        if std::env::var("STARLING_K8S_IT").is_err() {
+            eprintln!("skipping: set STARLING_K8S_IT=1 to run");
+            return;
+        }
+        let ctx = String::from_utf8(
+            Command::new("kubectl")
+                .args(["config", "current-context"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert!(
+            ctx.trim().starts_with("kind-"),
+            "refusing to run against non-kind context: {}",
+            ctx.trim()
+        );
+
+        let api = Arc::new(crate::api::store::ApiObjectStore::new());
+        // The workload references the Tiltfile placeholder image, which must
+        // never reach the cluster as-is — it is unpullable.
+        let yaml = r#"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: starling-im-it
+spec:
+  containers:
+  - name: app
+    image: example/starling-im-it
+    command: ["sh", "-c", "sleep 3600"]
+"#;
+        api.create(
+            "KubernetesApply",
+            "default",
+            "starling-im-it",
+            serde_json::json!({
+                "spec": { "yaml": yaml, "imageMaps": ["example/starling-im-it"] }
+            }),
+        )
+        .unwrap();
+        // A completed build's resolved, pullable ref recorded on the ImageMap.
+        api.create(
+            "ImageMap",
+            "default",
+            "example/starling-im-it",
+            serde_json::json!({
+                "spec": { "selector": "example/starling-im-it" },
+                "status": { "image": "busybox:1.36" }
+            }),
+        )
+        .unwrap();
+
+        reconcile_kubernetes_apply(&api, "starling-im-it")
+            .await
+            .expect("apply with image-map injection");
+
+        let img = Command::new("kubectl")
+            .args([
+                "get",
+                "pod",
+                "starling-im-it",
+                "-o",
+                "jsonpath={.spec.containers[0].image}",
+            ])
+            .output()
+            .unwrap();
+        let deployed = String::from_utf8_lossy(&img.stdout).to_string();
+
+        // Clean up.
+        Command::new("kubectl")
+            .args([
+                "delete",
+                "pod",
+                "starling-im-it",
+                "--ignore-not-found",
+                "--force",
+                "--grace-period=0",
+            ])
+            .output()
+            .ok();
+
+        assert_eq!(
+            deployed, "busybox:1.36",
+            "ImageMap status.image was not injected into the deployed workload"
+        );
     }
 
     /// BuildKit secret passthrough: build an image whose `RUN` mounts a secret,
@@ -5873,7 +6448,7 @@ spec:
         });
 
         let recs = default_reconcilers();
-        assert_eq!(recs.len(), 2);
+        assert_eq!(recs.len(), 3);
         let api = ApiObjectStore::new();
 
         // Force-trigger annotation -> a build is enqueued for "web".
@@ -5900,6 +6475,179 @@ spec:
             .unwrap();
         recs.dispatch(&ObjectEvent::Added(cm), &store);
         assert!(store.is_resource_disabled("web"));
+    }
+
+    #[tokio::test]
+    async fn trigger_queue_enqueues_builds_with_nonce_dedupe() {
+        use crate::api::store::{ApiObjectStore, ObjectEvent};
+        use crate::api::v1alpha1::{ObjectMeta, UIResource, UIResourceStatus};
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let store = Arc::new(Store::new(tx));
+        store.upsert_resource(UIResource {
+            metadata: Some(ObjectMeta {
+                name: "web".to_string(),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(UIResourceStatus::default()),
+        });
+        let recs = default_reconcilers();
+        let api = ApiObjectStore::new();
+
+        // Writing the resource into spec.queue with a nonce triggers one build.
+        let q = api
+            .create(
+                "TriggerQueue",
+                "default",
+                "queue",
+                serde_json::json!({"spec": {"queue": [{"name": "web", "nonce": "n1"}]}}),
+            )
+            .unwrap();
+        recs.dispatch(&ObjectEvent::Added(q.clone()), &store);
+        assert_eq!(rx.try_recv().unwrap().name(), "web");
+
+        // Re-emitting the same object (e.g. an engine status.queue write) does
+        // not re-fire — the nonce is already seen.
+        recs.dispatch(&ObjectEvent::Modified(q), &store);
+        assert!(rx.try_recv().is_err(), "same nonce should not re-trigger");
+
+        // A new nonce re-triggers.
+        let q2 = api
+            .replace(
+                "TriggerQueue",
+                "default",
+                "queue",
+                serde_json::json!({"spec": {"queue": [{"name": "web", "nonce": "n2"}]}}),
+            )
+            .unwrap();
+        recs.dispatch(&ObjectEvent::Modified(q2), &store);
+        assert_eq!(rx.try_recv().unwrap().name(), "web");
+    }
+
+    #[test]
+    fn pod_log_selector_joins_match_labels() {
+        let obj = serde_json::json!({
+            "spec": {"selector": {"matchLabels": {"app": "web"}}}
+        });
+        assert_eq!(pod_log_selector(&obj), "app=web");
+        // Missing selector -> empty (the controller skips it).
+        assert_eq!(pod_log_selector(&serde_json::json!({"spec": {}})), "");
+    }
+
+    #[test]
+    fn content_addressed_ref_derives_immutable_tag_from_digest() {
+        assert_eq!(
+            immutable_image_tag("sha256:0123456789abcdef0000"),
+            "starling-0123456789ab"
+        );
+        // Short / unprefixed digests are handled without panicking.
+        assert_eq!(immutable_image_tag("abcd"), "starling-abcd");
+        assert_eq!(
+            content_addressed_ref("registry.local/web:dev", "sha256:deadbeefcafe1234"),
+            "registry.local/web:starling-deadbeefcafe"
+        );
+        // A digest already pinned in a ref is extracted; a plain tag is not.
+        assert_eq!(
+            digest_from_ref("web@sha256:abc"),
+            Some("sha256:abc".to_string())
+        );
+        assert_eq!(digest_from_ref("web:tag"), None);
+    }
+
+    #[test]
+    fn injects_resolved_image_map_refs_into_workload_yaml() {
+        let api = Arc::new(crate::api::store::ApiObjectStore::new());
+        // The apply object references one ImageMap by name (as materialize sets it).
+        api.apply(
+            "KubernetesApply",
+            "default",
+            "web",
+            serde_json::json!({"spec": {"imageMaps": ["example/web"]}}),
+        );
+        api.apply(
+            "ImageMap",
+            "default",
+            "example/web",
+            serde_json::json!({"spec": {"selector": "example/web"}}),
+        );
+        // No resolved image yet -> nothing to inject (a not-yet-built image).
+        assert!(resolve_image_maps_for(&api, "web").is_empty());
+
+        // A completed build records the immutable deploy ref on status.image.
+        api.patch(
+            "ImageMap",
+            "default",
+            "example/web",
+            serde_json::json!({"status": {"image": "example/web:starling-abc123def456"}}),
+        )
+        .unwrap();
+        let maps = resolve_image_maps_for(&api, "web");
+        assert_eq!(
+            maps,
+            vec![(
+                "example/web".to_string(),
+                "example/web:starling-abc123def456".to_string()
+            )]
+        );
+
+        let yaml = "apiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n      - name: web\n        image: example/web\n---\nkind: Service";
+        let out = inject_image_maps(yaml, &maps);
+        assert!(
+            out.contains("image: example/web:starling-abc123def456"),
+            "image not injected: {out}"
+        );
+        assert!(out.contains("kind: Service"), "second doc dropped: {out}");
+        // Empty maps leave the YAML byte-for-byte untouched.
+        assert_eq!(inject_image_maps(yaml, &[]), yaml);
+    }
+
+    #[test]
+    fn file_watch_object_round_trips_watch_spec() {
+        let mut m = Manifest::new("web", TargetKind::Local);
+        m.deps = vec![PathBuf::from("/tmp/src")];
+        m.trigger_mode = 2; // Manual: file changes mark pending, don't build.
+        m.ignore_rules = vec![IgnoreRule {
+            base: PathBuf::from("/tmp"),
+            pattern: "*.tmp".to_string(),
+        }];
+        let obj = file_watch_object(&m);
+        let spec = &obj["spec"];
+        assert_eq!(spec["watchedPaths"], serde_json::json!(["/tmp/src"]));
+        assert_eq!(spec["manual"], serde_json::json!(true));
+        let rules = parse_ignore_rules(&spec["ignores"]);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].pattern, "*.tmp");
+        assert_eq!(rules[0].base, PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn file_watch_controller_tracks_and_replaces_handles() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let store = Arc::new(Store::new(tx.clone()));
+        let mut handles: HashMap<String, Arc<AtomicBool>> = HashMap::new();
+
+        // Empty watchedPaths -> no watcher registered.
+        let empty = serde_json::json!({"spec": {"watchedPaths": []}});
+        start_file_watch("web", &empty, &tx, &store, &mut handles);
+        assert!(!handles.contains_key("web"));
+
+        // A real path registers a live (un-stopped) handle.
+        let obj = serde_json::json!({"spec": {"watchedPaths": ["/nonexistent-starling-it"]}});
+        start_file_watch("web", &obj, &tx, &store, &mut handles);
+        let first = handles.get("web").cloned().unwrap();
+        assert!(!first.load(Ordering::Relaxed));
+
+        // Re-starting (e.g. on reload / object Modified) signals the old watcher
+        // to stop and installs a fresh handle.
+        start_file_watch("web", &obj, &tx, &store, &mut handles);
+        assert!(
+            first.load(Ordering::Relaxed),
+            "previous watcher should be signalled to stop"
+        );
+        let second = handles.get("web").cloned().unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(!second.load(Ordering::Relaxed));
     }
 
     #[test]

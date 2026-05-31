@@ -235,6 +235,7 @@ impl Daemon {
                             pid,
                             resources: vec![],
                             objects: vec![],
+                            api_addr: None,
                         },
                         logs: HashMap::new(),
                         commands: vec![],
@@ -259,11 +260,15 @@ impl Daemon {
                 resources,
                 logs,
                 objects,
+                api_addr,
             } => {
                 let mut inner = self.inner.lock().await;
                 if let Some(inst) = inner.instances.get_mut(&instance) {
                     inst.state.resources = resources;
                     inst.state.objects = objects;
+                    if api_addr.is_some() {
+                        inst.state.api_addr = api_addr;
+                    }
                     inst.last_seen = Instant::now();
                     // The reporter sends only lines appended since its last
                     // push, so append (don't replace) to preserve scrollback
