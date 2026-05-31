@@ -1,0 +1,15 @@
+# Cross-compilation to Windows (x86_64-pc-windows-gnu) via mingw-w64.
+#
+# Lets `cargo check --target x86_64-pc-windows-gnu` verify the crate builds for
+# Windows from a Unix host (mingw bundles the Windows API headers the C deps need
+# — aws-lc-sys/ring). Install the toolchain with:
+#   rustup target add x86_64-pc-windows-gnu
+#   brew install mingw-w64        # or your platform's mingw-w64 package
+# This only takes effect when that target is selected, so it's inert otherwise.
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+
+[env]
+CC_x86_64_pc_windows_gnu = "x86_64-w64-mingw32-gcc"
+CXX_x86_64_pc_windows_gnu = "x86_64-w64-mingw32-g++"
+AR_x86_64_pc_windows_gnu = "x86_64-w64-mingw32-ar"

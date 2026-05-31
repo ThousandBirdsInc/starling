@@ -640,9 +640,7 @@ fn html_escape(s: &str) -> String {
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]
@@ -659,9 +657,18 @@ mod tests {
 
     #[test]
     fn formats_urls() {
-        assert_eq!(format_url("web.localhost", 1355, false), "http://web.localhost:1355");
-        assert_eq!(format_url("web.localhost", 80, false), "http://web.localhost");
-        assert_eq!(format_url("web.localhost", 443, true), "https://web.localhost");
+        assert_eq!(
+            format_url("web.localhost", 1355, false),
+            "http://web.localhost:1355"
+        );
+        assert_eq!(
+            format_url("web.localhost", 80, false),
+            "http://web.localhost"
+        );
+        assert_eq!(
+            format_url("web.localhost", 443, true),
+            "https://web.localhost"
+        );
     }
 
     #[test]

@@ -6,12 +6,13 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
 use super::protocol::{socket_path, Request, Response};
 
 #[derive(Clone)]
 pub struct DaemonClient {
+    // Read only on Unix (the socket path); Windows resolves the port from a file.
+    #[cfg_attr(windows, allow(dead_code))]
     sock: PathBuf,
 }
 
@@ -22,12 +23,27 @@ impl DaemonClient {
         }
     }
 
-    /// Send one request and read one response (connection-per-request).
+    /// Send one request and read one response (connection-per-request). Connects
+    /// over the Unix socket on Unix, or the daemon's recorded 127.0.0.1 TCP port
+    /// on Windows.
     pub async fn call(&self, req: &Request) -> Result<Response> {
-        let stream = UnixStream::connect(&self.sock)
+        #[cfg(unix)]
+        let stream = tokio::net::UnixStream::connect(&self.sock)
             .await
             .map_err(|e| anyhow!("connecting to daemon at {}: {e}", self.sock.display()))?;
-        let (read_half, mut write_half) = stream.into_split();
+        #[cfg(windows)]
+        let stream = {
+            let port_file = super::protocol::port_file_path();
+            let port: u16 = std::fs::read_to_string(&port_file)
+                .map_err(|e| anyhow!("reading daemon port {}: {e}", port_file.display()))?
+                .trim()
+                .parse()
+                .map_err(|e| anyhow!("bad daemon port: {e}"))?;
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .map_err(|e| anyhow!("connecting to daemon at 127.0.0.1:{port}: {e}"))?
+        };
+        let (read_half, mut write_half) = tokio::io::split(stream);
         let mut line = serde_json::to_string(req)?;
         line.push('\n');
         write_half.write_all(line.as_bytes()).await?;
@@ -96,8 +112,7 @@ impl DaemonClient {
                 cmd.stderr(Stdio::from(f2));
             }
         }
-        cmd.spawn()
-            .map_err(|e| anyhow!("spawning daemon: {e}"))?;
+        cmd.spawn().map_err(|e| anyhow!("spawning daemon: {e}"))?;
 
         // Wait for the socket to come up.
         for _ in 0..40 {
@@ -106,6 +121,9 @@ impl DaemonClient {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        Err(anyhow!("daemon did not start within 2s; see {}", log.display()))
+        Err(anyhow!(
+            "daemon did not start within 2s; see {}",
+            log.display()
+        ))
     }
 }

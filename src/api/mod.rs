@@ -3,5 +3,6 @@
 //! Split to mirror the Go layout: `v1alpha1` holds the Kubernetes-style
 //! resource types, `webview` holds the `View` envelope streamed to the UI.
 
+pub mod store;
 pub mod v1alpha1;
 pub mod webview;

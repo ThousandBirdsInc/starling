@@ -7,6 +7,53 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
+/// A readiness probe action (Tilt's `exec_action` / `tcp_socket_action` /
+/// `http_get_action`). Serialized to JSON to flow through Starlark values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProbeAction {
+    /// Run a command in a subprocess; success = exit status 0.
+    Exec { command: Vec<String> },
+    /// Open a TCP connection; success = connection established.
+    Tcp { host: String, port: u16 },
+    /// Issue an HTTP GET; success = response status < 400.
+    Http {
+        host: String,
+        port: u16,
+        scheme: String,
+        path: String,
+    },
+}
+
+/// A readiness probe (Tilt's `probe(...)`). Gates a `serve_cmd` resource to
+/// "ready" only once the probe action succeeds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadinessProbe {
+    #[serde(default)]
+    pub initial_delay_secs: f64,
+    #[serde(default = "default_period_secs")]
+    pub period_secs: f64,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: f64,
+    #[serde(default = "default_probe_threshold")]
+    pub success_threshold: i32,
+    #[serde(default = "default_probe_threshold")]
+    pub failure_threshold: i32,
+    pub action: ProbeAction,
+}
+
+fn default_period_secs() -> f64 {
+    1.0
+}
+fn default_timeout_secs() -> f64 {
+    1.0
+}
+fn default_probe_threshold() -> i32 {
+    1
+}
+
 /// How a command should be executed.
 #[derive(Debug, Clone, Default)]
 pub struct Cmd {
@@ -53,7 +100,11 @@ pub enum LiveUpdateStep {
     /// Copy `local` (relative to the Starlingfile) into the container at `remote`.
     Sync { local: String, remote: String },
     /// Run a command inside the container after syncing.
-    Run { cmd: String },
+    Run {
+        cmd: String,
+        echo_off: bool,
+        triggers: Vec<String>,
+    },
     /// Changes to these paths force a full rebuild instead of a live update.
     /// (Recorded; the path-level fallback discrimination is future work.)
     FallBackOn(#[allow(dead_code)] Vec<String>),
@@ -69,15 +120,51 @@ pub struct DockerBuild {
     pub image_ref: String,
     pub context: PathBuf,
     pub dockerfile: Option<PathBuf>,
-    /// `--target` stage for multi-stage builds. Accepted for Tiltfile
-    /// compatibility; bollard's classic builder doesn't expose it yet.
-    #[allow(dead_code)]
+    /// Inline Dockerfile text from `docker_build(dockerfile_contents=...)`.
+    pub dockerfile_contents: Option<String>,
+    /// `--target` stage for multi-stage builds.
     pub target: Option<String>,
+    /// Docker platform in `os[/arch[/variant]]` form.
+    pub platform: Option<String>,
+    /// Additional image references to apply after a successful build.
+    pub extra_tags: Vec<String>,
+    /// Kubernetes command override for containers using this image.
+    pub entrypoint: Vec<String>,
+    /// Kubernetes args override for containers using this image.
+    pub container_args: Option<Vec<String>>,
+    /// Match this image ref in container env var values as well as image fields.
+    pub match_in_env_vars: bool,
     /// `--build-arg KEY=VALUE` pairs.
     pub build_args: Vec<(String, String)>,
+    /// Images used for build cache resolution.
+    pub cache_from: Vec<String>,
+    /// BuildKit SSH agent config strings from `docker_build(ssh=...)`.
+    pub ssh: Vec<String>,
+    /// BuildKit secret spec strings from `docker_build(secret=...)`.
+    pub secrets: Vec<String>,
+    /// Whether Docker should attempt to pull newer base images.
+    pub pull: bool,
+    /// Docker network mode for RUN steps during image build.
+    pub network: Option<String>,
+    /// Extra host mappings for image build containers.
+    pub extra_hosts: Vec<String>,
+    /// Dockerignore-style rules applied while tarring the build context.
+    pub ignore_rules: Vec<IgnoreRule>,
+    /// Tilt's `only=` context allowlist. Paths are relative to `context`.
+    pub only: Vec<PathBuf>,
     /// For `custom_build`: an arbitrary command that builds + tags the image
     /// (run with `EXPECTED_REF` set). When set, this replaces the bollard build.
     pub command: Option<Cmd>,
+    /// For `custom_build(tag=...)`: expected output tag/ref from the script.
+    pub custom_tag: Option<String>,
+    /// For `custom_build(outputs_image_ref_to=...)`: file containing the built ref.
+    pub outputs_image_ref_to: Option<PathBuf>,
+    /// For `custom_build(image_deps=...)`: image builds this custom build depends on.
+    pub image_deps: Vec<String>,
+    /// For `custom_build(disable_push=...)`.
+    pub disable_push: bool,
+    /// For `custom_build(skips_local_docker=...)`.
+    pub skips_local_docker: bool,
     /// For `custom_build`: file deps that trigger a rebuild.
     pub deps: Vec<PathBuf>,
     /// live_update steps: sync files into the running container instead of a
@@ -111,6 +198,17 @@ pub struct Manifest {
     pub notes: Vec<String>,
     /// Auto-init: build on startup without a manual trigger.
     pub auto_init: bool,
+    /// Whether this local resource's update command may run concurrently with
+    /// other resource updates.
+    pub allow_parallel: bool,
+    /// Readiness probe (`local_resource(readiness_probe=probe(...))`): when set,
+    /// the serve_cmd is held "pending" until the probe action first succeeds.
+    pub readiness_probe: Option<ReadinessProbe>,
+    /// Deprecated Tilt `test(...)` resources are modeled as local resources but
+    /// marked for frontend compatibility.
+    pub is_test: bool,
+    /// Ignore rules that suppress file-change rebuilds for this resource.
+    pub ignore_rules: Vec<IgnoreRule>,
 
     // -- Kubernetes-specific ----------------------------------------------
     /// Serialized YAML docs to `kubectl apply` for this resource.
@@ -122,8 +220,22 @@ pub struct Manifest {
     pub k8s_workload: Option<String>,
     /// Pod selector labels for watching pod status.
     pub pod_selector: std::collections::BTreeMap<String, String>,
+    /// If true, pod readiness does not gate runtime status.
+    pub pod_readiness_ignore: bool,
+    /// Custom Kubernetes deploy command registered by `k8s_custom_deploy(...)`.
+    pub k8s_custom_apply_cmd: Option<Cmd>,
+    /// Custom Kubernetes delete command registered by `k8s_custom_deploy(...)`.
+    pub k8s_custom_delete_cmd: Option<Cmd>,
+    /// Image deps requested by `k8s_custom_deploy(image_deps=...)`.
+    pub k8s_custom_image_deps: Vec<String>,
     /// live_update steps inherited from a matched docker_build.
     pub live_update: Vec<LiveUpdateStep>,
+    /// Kubernetes port-forwards requested by `k8s_resource(port_forwards=...)`.
+    pub k8s_port_forwards: Vec<PortForwardSpec>,
+
+    // -- Docker Compose-specific ------------------------------------------
+    /// Compose project name for disambiguating `dc_resource(project_name=...)`.
+    pub docker_compose_project: Option<String>,
 }
 
 /// A named host TCP port requested by the Starlingfile.
@@ -135,6 +247,14 @@ pub struct Manifest {
 pub struct NamedPortLease {
     pub name: String,
     pub preferred: Option<u16>,
+}
+
+/// A Dockerignore-style watch ignore rule. `base` is the directory patterns are
+/// evaluated relative to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoreRule {
+    pub base: PathBuf,
+    pub pattern: String,
 }
 
 impl Manifest {
@@ -158,11 +278,31 @@ impl Manifest {
             labels: std::collections::BTreeMap::new(),
             notes: vec![],
             auto_init: true,
+            allow_parallel: false,
+            readiness_probe: None,
+            is_test: false,
+            ignore_rules: vec![],
             k8s_apply_docs: vec![],
             docker_builds: vec![],
             k8s_workload: None,
             pod_selector: std::collections::BTreeMap::new(),
+            pod_readiness_ignore: false,
+            k8s_custom_apply_cmd: None,
+            k8s_custom_delete_cmd: None,
+            k8s_custom_image_deps: vec![],
             live_update: vec![],
+            k8s_port_forwards: vec![],
+            docker_compose_project: None,
         }
     }
+}
+
+/// A Kubernetes pod port-forward requested by `k8s_resource(port_forwards=...)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortForwardSpec {
+    pub host: String,
+    pub local_port: u16,
+    pub container_port: u16,
+    pub name: String,
+    pub link_path: String,
 }

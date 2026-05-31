@@ -64,7 +64,9 @@ pub fn tailscale_serve(proxy_port: u16) -> bool {
         .status();
     match status {
         Ok(s) if s.success() => {
-            println!("Tailscale: serving the proxy on your tailnet (see `tailscale serve status`).");
+            println!(
+                "Tailscale: serving the proxy on your tailnet (see `tailscale serve status`)."
+            );
             true
         }
         Ok(s) => {

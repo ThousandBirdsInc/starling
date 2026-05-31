@@ -28,8 +28,7 @@ pub fn ensure_ca() -> Result<(String, String)> {
     }
     std::fs::create_dir_all(state_dir()).ok();
 
-    let mut params = CertificateParams::new(vec![])
-        .context("creating CA params")?;
+    let mut params = CertificateParams::new(vec![]).context("creating CA params")?;
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![
         KeyUsagePurpose::KeyCertSign,
@@ -81,7 +80,8 @@ impl std::fmt::Debug for HostCertResolver {
 impl HostCertResolver {
     fn make_cert(&self, name: &str) -> Result<CertifiedKey> {
         let ca_key = KeyPair::from_pem(&self.ca_key_pem)?;
-        let ca_cert = CertificateParams::from_ca_cert_pem(&self.ca_cert_pem)?.self_signed(&ca_key)?;
+        let ca_cert =
+            CertificateParams::from_ca_cert_pem(&self.ca_cert_pem)?.self_signed(&ca_key)?;
         let leaf_key = KeyPair::generate()?;
         let mut params = CertificateParams::new(vec![name.to_string()])?;
         params.distinguished_name.push(DnType::CommonName, name);

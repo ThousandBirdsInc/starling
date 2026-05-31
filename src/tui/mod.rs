@@ -9,6 +9,7 @@
 //!   Enter      detail view for the selected resource (Esc to exit)
 //!   y          copy the visible log window to the clipboard
 //!   t          trigger the selected resource
+//!   Space      pause/resume the selected resource
 //!   R          restart the selected resource's serve_cmd
 //!   p          change the selected resource's preferred backend port
 //!   PgUp/PgDn  page through logs (G/End follow tail, g/Home jump to oldest)
@@ -60,7 +61,10 @@ fn status_symbol(s: &str, frame: usize) -> (&'static str, Style) {
     match s {
         "ok" => ("●", Style::default().fg(theme::OK)),
         "error" => ("●", Style::default().fg(theme::ERR)),
-        "in_progress" => (SPINNER[frame % SPINNER.len()], Style::default().fg(theme::WARN)),
+        "in_progress" => (
+            SPINNER[frame % SPINNER.len()],
+            Style::default().fg(theme::WARN),
+        ),
         "pending" => ("◌", Style::default().fg(theme::INFO)),
         "not_applicable" | "none" | "" => ("·", Style::default().fg(Color::DarkGray)),
         _ => ("•", Style::default()),
@@ -98,15 +102,30 @@ fn status_cell(s: &str, frame: usize, kind: StatusKind) -> Line<'static> {
     ])
 }
 
+/// Resource pause state, kept separate from build/runtime status so a paused
+/// resource is obvious even when its update/runtime columns are idle.
+fn state_cell(paused: bool) -> Line<'static> {
+    if paused {
+        Line::from(Span::styled("paused", Style::default().fg(theme::WARN)))
+    } else {
+        Line::from(Span::styled("active", Style::default().fg(theme::MUTED)))
+    }
+}
+
 /// Build a styled footer line from `(key, label)` pairs: keys in accent, labels muted.
 fn key_hints(pairs: &[(&str, &str)]) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
     for (k, label) in pairs {
         spans.push(Span::styled(
             (*k).to_string(),
-            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(format!(" {label}   "), Style::default().fg(theme::MUTED)));
+        spans.push(Span::styled(
+            format!(" {label}   "),
+            Style::default().fg(theme::MUTED),
+        ));
     }
     Line::from(spans)
 }
@@ -118,6 +137,7 @@ struct RowItem {
     instance_name: String,
     name: String,
     kind: String,
+    paused: bool,
     update: String,
     runtime: String,
     pod: String,
@@ -279,7 +299,11 @@ impl App {
     /// as plain text (ANSI styling stripped), and report the outcome.
     fn copy_visible_logs(&mut self) {
         let window = visible_window(&self.log_view, self.log_view_h, self.log_scroll);
-        let text = window.iter().map(|l| plain_log_text(l)).collect::<Vec<_>>().join("\n");
+        let text = window
+            .iter()
+            .map(|l| plain_log_text(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         let n = window.len();
         // `window` borrows `self`; it is unused past here, so `note` can borrow.
         if n == 0 {
@@ -485,7 +509,11 @@ fn extended_ansi_color(codes: &[u16]) -> Option<(Color, usize)> {
     match codes {
         [5, index, ..] => Some((Color::Indexed((*index).min(255) as u8), 2)),
         [2, r, g, b, ..] => Some((
-            Color::Rgb((*r).min(255) as u8, (*g).min(255) as u8, (*b).min(255) as u8),
+            Color::Rgb(
+                (*r).min(255) as u8,
+                (*g).min(255) as u8,
+                (*b).min(255) as u8,
+            ),
             4,
         )),
         _ => None,
@@ -528,8 +556,15 @@ fn filter_log_lines(logs: &[String], pattern: &str) -> Vec<String> {
     if pattern.is_empty() {
         return logs.to_vec();
     }
-    match regex::RegexBuilder::new(pattern).case_insensitive(true).build() {
-        Ok(re) => logs.iter().filter(|l| re.is_match(&plain_log_text(l))).cloned().collect(),
+    match regex::RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+    {
+        Ok(re) => logs
+            .iter()
+            .filter(|l| re.is_match(&plain_log_text(l)))
+            .cloned()
+            .collect(),
         Err(_) => {
             let needle = pattern.to_ascii_lowercase();
             logs.iter()
@@ -576,13 +611,16 @@ async fn event_loop(
                 .selected()
                 .unwrap_or(0)
                 .min(app.rows.len().saturating_sub(1));
-            app.table.select(if app.rows.is_empty() { None } else { Some(sel) });
-            match app.selected().map(|r| (r.instance_id.clone(), r.name.clone())) {
+            app.table
+                .select(if app.rows.is_empty() { None } else { Some(sel) });
+            match app
+                .selected()
+                .map(|r| (r.instance_id.clone(), r.name.clone()))
+            {
                 Some((instance, resource)) => {
                     // Same resource as last tick: fetch only lines past our
                     // cursor and append. Otherwise refetch the tail from scratch.
-                    let same = app.log_key.as_ref()
-                        == Some(&(instance.clone(), resource.clone()));
+                    let same = app.log_key.as_ref() == Some(&(instance.clone(), resource.clone()));
                     let since = if same { app.log_cursor } else { 0 };
                     let (lines, cursor) = fetch_logs(client, &instance, &resource, since).await;
                     if same {
@@ -605,8 +643,8 @@ async fn event_loop(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.code == KeyCode::Char('c');
+                let ctrl_c =
+                    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
                 if ctrl_c {
                     break;
                 }
@@ -666,7 +704,9 @@ async fn event_loop(
                                         Ok(Response::Error(e)) => {
                                             format!("couldn't change port: {e}")
                                         }
-                                        Ok(other) => format!("unexpected daemon response: {other:?}"),
+                                        Ok(other) => {
+                                            format!("unexpected daemon response: {other:?}")
+                                        }
                                         Err(e) => format!("couldn't change port: {e}"),
                                     };
                                     app.note(msg);
@@ -745,6 +785,11 @@ async fn event_loop(
                         KeyCode::Char('G') | KeyCode::End => app.log_scroll = 0,
                         KeyCode::Char('t') => {
                             if let Some(r) = app.selected() {
+                                if r.paused {
+                                    let name = r.name.clone();
+                                    app.note(format!("{name} is paused"));
+                                    continue;
+                                }
                                 let _ = client
                                     .call(&Request::Trigger {
                                         instance: r.instance_id.clone(),
@@ -753,6 +798,23 @@ async fn event_loop(
                                     .await;
                                 let name = r.name.clone();
                                 app.note(format!("triggered {name}"));
+                            }
+                        }
+                        KeyCode::Char(' ') => {
+                            if let Some(r) = app.selected() {
+                                let paused = !r.paused;
+                                let _ = client
+                                    .call(&Request::SetPaused {
+                                        instance: r.instance_id.clone(),
+                                        resource: r.name.clone(),
+                                        paused,
+                                    })
+                                    .await;
+                                let name = r.name.clone();
+                                app.note(format!(
+                                    "{} {name}",
+                                    if paused { "paused" } else { "resumed" }
+                                ));
                             }
                         }
                         KeyCode::Char('R') => {
@@ -769,30 +831,26 @@ async fn event_loop(
                         }
                         KeyCode::Char('p') => {
                             if let Some(r) = app.selected() {
-                                app.port_input = r
-                                    .route_port
-                                    .map(|p| p.to_string())
-                                    .unwrap_or_default();
+                                app.port_input =
+                                    r.route_port.map(|p| p.to_string()).unwrap_or_default();
                                 app.mode = Mode::PortEdit;
                             }
                         }
-                        KeyCode::Char('o') => {
-                            match app.selected() {
-                                Some(r) if !r.url.is_empty() => {
-                                    let url = r.url.clone();
-                                    let msg = match open_url(&url) {
-                                        Ok(()) => format!("opening {url}"),
-                                        Err(e) => format!("couldn't open {url}: {e}"),
-                                    };
-                                    app.note(msg);
-                                }
-                                Some(r) => {
-                                    let name = r.name.clone();
-                                    app.note(format!("{name} has no URL"));
-                                }
-                                None => {}
+                        KeyCode::Char('o') => match app.selected() {
+                            Some(r) if !r.url.is_empty() => {
+                                let url = r.url.clone();
+                                let msg = match open_url(&url) {
+                                    Ok(()) => format!("opening {url}"),
+                                    Err(e) => format!("couldn't open {url}: {e}"),
+                                };
+                                app.note(msg);
                             }
-                        }
+                            Some(r) => {
+                                let name = r.name.clone();
+                                app.note(format!("{name} has no URL"));
+                            }
+                            None => {}
+                        },
                         KeyCode::Char('y') => app.copy_visible_logs(),
                         _ => {}
                     },
@@ -844,6 +902,7 @@ fn filtered(state: &DashboardState, filter: &str) -> Vec<RowItem> {
                 instance_name: inst.name.clone(),
                 name: r.name.clone(),
                 kind: r.kind.clone(),
+                paused: r.paused,
                 update: r.update_status.clone(),
                 runtime: r.runtime_status.clone(),
                 pod: r.pod.clone().unwrap_or_default(),
@@ -939,7 +998,10 @@ fn visible_window(logs: &[String], h: usize, scroll: usize) -> &[String] {
 
 /// Render the on-screen window of `logs`, honoring scroll, with ANSI styling.
 fn log_lines(logs: &[String], h: usize, scroll: usize) -> Vec<Line<'static>> {
-    visible_window(logs, h, scroll).iter().map(|l| ansi_log_line(l)).collect()
+    visible_window(logs, h, scroll)
+        .iter()
+        .map(|l| ansi_log_line(l))
+        .collect()
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
@@ -966,15 +1028,27 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     let frame = app.spinner_frame();
     let header = Row::new(
-        ["INSTANCE", "RESOURCE", "TYPE", "UPDATE", "RUNTIME", "RESTARTS", "LAST START", "PORT", "POD", "URL"]
-            .iter()
-            .map(|h| {
-                Cell::from(*h).style(
-                    Style::default()
-                        .fg(theme::ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                )
-            }),
+        [
+            "INSTANCE",
+            "RESOURCE",
+            "STATE",
+            "TYPE",
+            "UPDATE",
+            "RUNTIME",
+            "RESTARTS",
+            "LAST START",
+            "PORT",
+            "POD",
+            "URL",
+        ]
+        .iter()
+        .map(|h| {
+            Cell::from(*h).style(
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            )
+        }),
     )
     .height(1)
     .bottom_margin(1);
@@ -983,15 +1057,23 @@ fn draw(f: &mut Frame, app: &mut App) {
         .iter()
         .map(|r| {
             Row::new(vec![
-                Cell::from(Span::styled(r.instance_name.clone(), Style::default().fg(theme::MUTED))),
+                Cell::from(Span::styled(
+                    r.instance_name.clone(),
+                    Style::default().fg(theme::MUTED),
+                )),
                 Cell::from(Span::styled(
                     r.name.clone(),
                     Style::default().add_modifier(Modifier::BOLD),
                 )),
+                Cell::from(state_cell(r.paused)),
                 Cell::from(r.kind.clone()),
                 Cell::from(status_cell(&r.update, frame, StatusKind::Update)),
                 Cell::from(status_cell(&r.runtime, frame, StatusKind::Runtime)),
-                Cell::from(r.restart_count.map(|count| count.to_string()).unwrap_or_default()),
+                Cell::from(
+                    r.restart_count
+                        .map(|count| count.to_string())
+                        .unwrap_or_default(),
+                ),
                 Cell::from(format_start_time(r.last_start.as_deref(), false)),
                 Cell::from(r.route_port.map(|p| p.to_string()).unwrap_or_default()),
                 Cell::from(r.pod.clone()),
@@ -1002,6 +1084,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     let widths = [
         Constraint::Length(14),
         Constraint::Length(18),
+        Constraint::Length(8),
         Constraint::Length(6),
         Constraint::Length(13),
         Constraint::Length(13),
@@ -1020,11 +1103,15 @@ fn draw(f: &mut Frame, app: &mut App) {
                 .border_style(Style::default().fg(theme::MUTED))
                 .title(Span::styled(
                     " Resources ",
-                    Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD),
                 )),
         )
         .highlight_style(
-            Style::default().bg(theme::SEL_BG).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(theme::SEL_BG)
+                .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(Span::styled("▌ ", Style::default().fg(theme::ACCENT)));
     f.render_stateful_widget(table, chunks[1], &mut app.table);
@@ -1036,7 +1123,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     let h = chunks[2].height.saturating_sub(2) as usize;
     app.log_view_h = h;
     app.ensure_log_view();
-    let follow = if app.log_scroll == 0 { "" } else { " · scrolled" };
+    let follow = if app.log_scroll == 0 {
+        ""
+    } else {
+        " · scrolled"
+    };
     let filt = if app.log_filter.is_empty() {
         String::new()
     } else {
@@ -1064,9 +1155,14 @@ fn draw(f: &mut Frame, app: &mut App) {
         Line::from(vec![
             Span::styled(
                 " No resources. ",
-                Style::default().fg(theme::WARN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::WARN)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("Run `starling up` in a project.", Style::default().fg(theme::MUTED)),
+            Span::styled(
+                "Run `starling up` in a project.",
+                Style::default().fg(theme::MUTED),
+            ),
         ])
     } else if let Some(msg) = app.active_status() {
         status_footer(msg)
@@ -1078,6 +1174,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             ("o", "open"),
             ("y", "copy logs"),
             ("t", "trigger"),
+            ("Space", "pause"),
             ("R", "restart"),
             ("p", "port"),
             ("/", "filter"),
@@ -1115,8 +1212,16 @@ fn title_bar(app: &App) -> Paragraph<'static> {
 fn prompt_line(label: &str, value: &str, hint: &str) -> Line<'static> {
     Line::from(vec![
         Span::raw(" "),
-        Span::styled(format!("{label} "), Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{value}\u{2588}"), Style::default().fg(Color::White)),
+        Span::styled(
+            format!("{label} "),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{value}\u{2588}"),
+            Style::default().fg(Color::White),
+        ),
         Span::styled(format!("   {hint} "), Style::default().fg(theme::MUTED)),
     ])
 }
@@ -1135,7 +1240,9 @@ fn log_body(logs: &[String], h: usize, scroll: usize) -> Vec<Line<'static>> {
     if logs.is_empty() {
         return vec![Line::from(Span::styled(
             "  — no log output yet —",
-            Style::default().fg(theme::MUTED).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(theme::MUTED)
+                .add_modifier(Modifier::ITALIC),
         ))];
     }
     log_lines(logs, h, scroll)
@@ -1146,7 +1253,7 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Length(10),
+            Constraint::Length(13),
             Constraint::Min(4),
             Constraint::Length(1),
         ])
@@ -1157,6 +1264,7 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
         instance_name: "—".into(),
         name: "—".into(),
         kind: String::new(),
+        paused: false,
         update: String::new(),
         runtime: String::new(),
         pod: String::new(),
@@ -1187,8 +1295,19 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
 
     let field = |k: &'static str| Span::styled(k, Style::default().fg(theme::MUTED));
     let info = vec![
-        Line::from(vec![field("instance  "), Span::raw(r.instance_name.clone())]),
-        Line::from(vec![field("resource  "), Span::styled(r.name.clone(), bold())]),
+        Line::from(vec![
+            field("instance  "),
+            Span::raw(r.instance_name.clone()),
+        ]),
+        Line::from(vec![
+            field("resource  "),
+            Span::styled(r.name.clone(), bold()),
+        ]),
+        Line::from({
+            let mut v = vec![field("state     ")];
+            v.extend(state_cell(r.paused).spans);
+            v
+        }),
         Line::from(vec![field("type      "), Span::raw(r.kind.clone())]),
         Line::from({
             let mut v = vec![field("update    ")];
@@ -1202,15 +1321,30 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
         }),
         Line::from(vec![
             field("restarts "),
-            Span::raw(r.restart_count.map(|count| count.to_string()).unwrap_or_default()),
+            Span::raw(
+                r.restart_count
+                    .map(|count| count.to_string())
+                    .unwrap_or_default(),
+            ),
         ]),
         Line::from(vec![
             field("started  "),
             Span::raw(format_start_time(r.last_start.as_deref(), true)),
         ]),
-        Line::from(vec![field("port      "), Span::raw(r.route_port.map(|p| p.to_string()).unwrap_or_default())]),
+        Line::from(vec![
+            field("port      "),
+            Span::raw(r.route_port.map(|p| p.to_string()).unwrap_or_default()),
+        ]),
         Line::from(vec![field("pod       "), Span::raw(r.pod.clone())]),
-        Line::from(vec![field("url       "), Span::styled(r.url.clone(), Style::default().fg(theme::URL).add_modifier(Modifier::UNDERLINED))]),
+        Line::from(vec![
+            field("url       "),
+            Span::styled(
+                r.url.clone(),
+                Style::default()
+                    .fg(theme::URL)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+        ]),
     ];
     f.render_widget(
         Paragraph::new(info).block(
@@ -1218,7 +1352,12 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(theme::MUTED))
-                .title(Span::styled(" Status ", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))),
+                .title(Span::styled(
+                    " Status ",
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                )),
         ),
         chunks[1],
     );
@@ -1245,6 +1384,7 @@ fn draw_detail(f: &mut Frame, app: &mut App) {
             ("o", "open"),
             ("y", "copy logs"),
             ("t", "trigger"),
+            ("Space", "pause"),
             ("R", "restart"),
             ("p", "port"),
             ("PgUp/Dn", "scroll"),
@@ -1278,7 +1418,10 @@ mod tests {
         // Carriage returns and other control bytes are dropped; tabs expand.
         assert_eq!(plain_log_text("a\rb\tc\u{0}"), "ab    c");
         // Emoji and other printable Unicode survive intact.
-        assert_eq!(plain_log_text("\u{1b}[33m\u{2728} built \u{1f680}"), "\u{2728} built \u{1f680}");
+        assert_eq!(
+            plain_log_text("\u{1b}[33m\u{2728} built \u{1f680}"),
+            "\u{2728} built \u{1f680}"
+        );
         // A lone trailing ESC doesn't panic and is dropped.
         assert_eq!(plain_log_text("hi\u{1b}"), "hi");
     }
@@ -1354,7 +1497,10 @@ mod tests {
         // The same raw status reads differently per column: a build vs. a
         // serve_cmd coming back up after a restart.
         assert_eq!(pretty_status("in_progress", StatusKind::Update), "building");
-        assert_eq!(pretty_status("in_progress", StatusKind::Runtime), "restarting");
+        assert_eq!(
+            pretty_status("in_progress", StatusKind::Runtime),
+            "restarting"
+        );
         // Other values are column-independent.
         assert_eq!(pretty_status("ok", StatusKind::Runtime), "ok");
         assert_eq!(pretty_status("none", StatusKind::Runtime), "—");

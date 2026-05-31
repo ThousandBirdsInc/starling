@@ -1,0 +1,71 @@
+name: parity
+
+# Cross-environment parity matrix for the Tilt port.
+#
+# The `unit` job runs the full unit suite on Linux, macOS, and Windows — so the
+# platform-specific command-construction paths (`cmd.exe /S /C` vs `sh -c`, the
+# `*_bat` variants) are actually executed on a real Windows runner, not just
+# compiled. The `integration` job stands up a real kind cluster + Docker on Linux
+# and runs the env-gated controller/transport/BuildKit integration tests.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt-clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      # Lint, but don't fail on the known pre-existing dead-code warnings; deny
+      # only genuine clippy errors.
+      - run: cargo clippy --all-targets
+
+  unit:
+    name: unit (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The default (non-ignored) suite is hermetic — no cluster/daemon needed —
+      # so it runs identically on all three platforms. On windows-latest this
+      # exercises the Windows host-shell command paths on a real Windows host.
+      - run: cargo test --locked
+
+  integration:
+    name: integration (kind + docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Docker is preinstalled on ubuntu runners; bring up a kind cluster.
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: starling-test
+      - name: Confirm kind context (integration tests also assert this)
+        run: |
+          kubectl config current-context
+          kubectl config current-context | grep -q '^kind-' || {
+            echo "refusing to run cluster tests against a non-kind context"; exit 1; }
+      - name: Run gated integration tests
+        env:
+          STARLING_K8S_IT: "1"
+          STARLING_DC_IT: "1"
+        # Single-threaded: a few tests toggle the STARLING_KUBE_RS process env var.
+        run: cargo test --locked -- --ignored --test-threads=1

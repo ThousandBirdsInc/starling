@@ -8,11 +8,14 @@
 
 mod api;
 mod certs;
+mod ci;
 mod daemon;
 mod engine;
 mod health;
 mod k8s;
+mod kube_client;
 mod netmodes;
+mod probe;
 mod proxy;
 mod seed;
 mod server;
@@ -30,7 +33,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::daemon::client::DaemonClient;
 use crate::daemon::protocol::{
-    Command as DaemonCommand, InstanceState, Request, ResourceSnapshot, Response,
+    ApiObjectSnapshot, Command as DaemonCommand, InstanceState, Request, ResourceSnapshot, Response,
 };
 use crate::proxy::{ProxyConfig, ProxyHandle, ProxyRegistry};
 use crate::server::AppState;
@@ -61,6 +64,34 @@ enum Command {
     Skills(SkillsArgs),
     /// Run the central daemon (auto-started by `up`/`dash` if not running).
     Daemon(DaemonArgs),
+    /// Bring the project up once in batch mode and exit 0/non-zero based on
+    /// whether everything came up (Tilt's `tilt ci`).
+    Ci(CiArgs),
+    /// List API objects from the running instance(s) (Tilt's `tilt get`).
+    Get(GetArgs),
+    /// Show a single API object in detail (Tilt's `tilt describe`).
+    Describe(DescribeArgs),
+    /// List the API object kinds available (Tilt's `tilt api-resources`).
+    ApiResources,
+    /// Print the Starling version (Tilt's `tilt version`).
+    Version,
+    /// Describe the spec fields of an API object kind (Tilt's `tilt explain`).
+    Explain(ExplainArgs),
+    /// Print a diagnostic bundle: version, environment, daemon + resource health
+    /// (Tilt's `tilt doctor`).
+    Doctor,
+    /// Replace the running instance's Tiltfile args and reload (Tilt's `tilt args`).
+    Args(ArgsArgs),
+    /// Write a JSON snapshot of the current dashboard state (Tilt's `tilt snapshot`).
+    Snapshot(SnapshotArgs),
+    /// Dump internal state as JSON to stdout (Tilt's `tilt dump`).
+    Dump(DumpArgs),
+    /// Queue a build for a resource (Tilt's `tilt trigger`).
+    Trigger(ResourceArgs),
+    /// Enable (resume) a paused resource (Tilt's `tilt enable`).
+    Enable(ResourceArgs),
+    /// Disable (pause) a resource (Tilt's `tilt disable`).
+    Disable(ResourceArgs),
     /// Open the shared k9s-style TUI dashboard (default when run with no args).
     Dash(DashArgs),
     /// Install the local Starling CA into the system trust store (for HTTPS).
@@ -109,6 +140,95 @@ struct UpArgs {
     /// Share the proxy on your tailnet via `tailscale serve` (experimental).
     #[arg(long, default_value_t = false)]
     tailscale: bool,
+    /// Tiltfile args passed after `--`.
+    #[arg(last = true)]
+    tiltfile_args: Vec<String>,
+}
+
+#[derive(Parser)]
+struct GetArgs {
+    /// Object kind to list (e.g. KubernetesApply, Cmd, FileWatch). Omit to list
+    /// the available kinds.
+    kind: Option<String>,
+    /// Optional object name to fetch a single object.
+    name: Option<String>,
+    /// Emit the raw object JSON instead of a summary table.
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+#[derive(Parser)]
+struct CiArgs {
+    /// Config to load. Defaults to ./Starlingfile, falling back to ./Tiltfile.
+    #[arg(long)]
+    file: Option<String>,
+    /// Apply Kubernetes manifests with `--dry-run=client` (nothing mutated).
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+    /// Fail the run if it has not settled within this many seconds. Overrides
+    /// `ci_settings(timeout=...)`; defaults to that, else 300s.
+    #[arg(long)]
+    timeout: Option<u64>,
+    /// Tiltfile args passed after `--`.
+    #[arg(last = true)]
+    tiltfile_args: Vec<String>,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum DumpTarget {
+    /// Aggregated dashboard state (instances, resources, routes).
+    State,
+    /// All API objects across instances.
+    Objects,
+    /// The generated OpenAPI document for the tilt.dev/v1alpha1 types.
+    Openapi,
+}
+
+#[derive(Parser)]
+struct DumpArgs {
+    /// What to dump.
+    #[arg(value_enum)]
+    target: DumpTarget,
+}
+
+#[derive(Parser)]
+struct SnapshotArgs {
+    /// Output file path (defaults to ./starling-snapshot.json).
+    #[arg(long, default_value = "starling-snapshot.json")]
+    out: String,
+}
+
+#[derive(Parser)]
+struct ArgsArgs {
+    /// Config to identify the project. Defaults to ./Starlingfile, then ./Tiltfile.
+    #[arg(long)]
+    file: Option<String>,
+    /// New Tiltfile args (after `--`). Pass none to clear them.
+    #[arg(last = true)]
+    tiltfile_args: Vec<String>,
+}
+
+#[derive(Parser)]
+struct ResourceArgs {
+    /// Resource name.
+    resource: String,
+    /// Config to identify the project. Defaults to ./Starlingfile, then ./Tiltfile.
+    #[arg(long)]
+    file: Option<String>,
+}
+
+#[derive(Parser)]
+struct ExplainArgs {
+    /// Object kind to explain (e.g. KubernetesApply, Cmd). Omit to list kinds.
+    kind: Option<String>,
+}
+
+#[derive(Parser)]
+struct DescribeArgs {
+    /// Object kind (e.g. KubernetesApply, Cmd, FileWatch).
+    kind: String,
+    /// Object name.
+    name: String,
 }
 
 #[derive(Parser)]
@@ -298,6 +418,85 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Command::Ci(a)) => {
+            // ci() exits the process itself with the right code.
+            ci(a).await;
+        }
+        Some(Command::Get(a)) => {
+            if let Err(e) = get(a).await {
+                eprintln!("starling get: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Describe(a)) => {
+            if let Err(e) = describe(a).await {
+                eprintln!("starling describe: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::ApiResources) => {
+            if let Err(e) = get(GetArgs {
+                kind: None,
+                name: None,
+                json: false,
+            })
+            .await
+            {
+                eprintln!("starling api-resources: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Version) => {
+            println!("starling {}", env!("CARGO_PKG_VERSION"));
+        }
+        Some(Command::Explain(a)) => {
+            if let Err(e) = explain(a) {
+                eprintln!("starling explain: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Doctor) => {
+            if let Err(e) = doctor().await {
+                eprintln!("starling doctor: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Args(a)) => {
+            if let Err(e) = set_args(a).await {
+                eprintln!("starling args: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Snapshot(a)) => {
+            if let Err(e) = write_snapshot(a).await {
+                eprintln!("starling snapshot: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Dump(a)) => {
+            if let Err(e) = dump(a).await {
+                eprintln!("starling dump: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Trigger(a)) => {
+            if let Err(e) = resource_command(a, ResourceAction::Trigger).await {
+                eprintln!("starling trigger: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Enable(a)) => {
+            if let Err(e) = resource_command(a, ResourceAction::Enable).await {
+                eprintln!("starling enable: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Disable(a)) => {
+            if let Err(e) = resource_command(a, ResourceAction::Disable).await {
+                eprintln!("starling disable: {e}");
+                std::process::exit(1);
+            }
+        }
         Some(Command::Dash(a)) => tui::run(a.proxy_port, &a.tld, a.tls).await,
         Some(Command::Trust) => {
             if let Err(e) = certs::install_trust() {
@@ -374,9 +573,15 @@ fn snapshot(r: &api::v1alpha1::UIResource) -> ResourceSnapshot {
         .iter()
         .find(|c| c.condition_type == "ProxyReachable");
     let local = st.local_resource_info.as_ref();
+    let paused = st
+        .disable_status
+        .as_ref()
+        .map(|d| d.state == "Disabled")
+        .unwrap_or(false);
     ResourceSnapshot {
         name,
         kind,
+        paused,
         update_status: st.update_status.unwrap_or_default(),
         runtime_status: st.runtime_status.unwrap_or_default(),
         pod,
@@ -459,6 +664,449 @@ fn project_dir_path(file: &PathBuf) -> PathBuf {
 
 fn project_dir(file: &PathBuf) -> String {
     project_dir_path(file).display().to_string()
+}
+
+async fn get(args: GetArgs) -> anyhow::Result<()> {
+    let client = DaemonClient::new();
+
+    // No kind given: list the available object kinds.
+    let Some(kind) = args.kind.clone() else {
+        let Response::Objects(objects) = client.call(&Request::GetObjects { kind: None }).await?
+        else {
+            anyhow::bail!("daemon returned unexpected response");
+        };
+        let mut kinds: Vec<String> = objects.into_iter().map(|o| o.kind).collect();
+        kinds.sort();
+        kinds.dedup();
+        if kinds.is_empty() {
+            println!("No API objects found (is an instance running?)");
+        } else {
+            println!("Available kinds:");
+            for k in kinds {
+                println!("  {k}");
+            }
+        }
+        return Ok(());
+    };
+
+    let Response::Objects(mut objects) = client
+        .call(&Request::GetObjects {
+            kind: Some(kind.clone()),
+        })
+        .await?
+    else {
+        anyhow::bail!("daemon returned unexpected response");
+    };
+    if let Some(name) = &args.name {
+        objects.retain(|o| &o.name == name);
+        if objects.is_empty() {
+            anyhow::bail!("{kind} \"{name}\" not found");
+        }
+    }
+    if objects.is_empty() {
+        println!("No {kind} objects found");
+        return Ok(());
+    }
+
+    if args.json {
+        let values: Vec<&serde_json::Value> = objects.iter().map(|o| &o.object).collect();
+        // A single named object prints bare; a list prints as an array.
+        if args.name.is_some() && values.len() == 1 {
+            println!("{}", serde_json::to_string_pretty(values[0])?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&values)?);
+        }
+        return Ok(());
+    }
+
+    println!("{:<28} {}", "NAME", "KIND");
+    for o in &objects {
+        println!("{:<28} {}", o.name, o.kind);
+    }
+    Ok(())
+}
+
+async fn describe(args: DescribeArgs) -> anyhow::Result<()> {
+    let client = DaemonClient::new();
+    let Response::Objects(objects) = client
+        .call(&Request::GetObjects {
+            kind: Some(args.kind.clone()),
+        })
+        .await?
+    else {
+        anyhow::bail!("daemon returned unexpected response");
+    };
+    let Some(obj) = objects.into_iter().find(|o| o.name == args.name) else {
+        anyhow::bail!("{} \"{}\" not found", args.kind, args.name);
+    };
+
+    println!("Name:    {}", obj.name);
+    println!("Kind:    {}", obj.kind);
+    if let Some(meta) = obj.object.get("metadata") {
+        if let Some(uid) = meta.get("uid").and_then(|v| v.as_str()) {
+            println!("UID:     {uid}");
+        }
+        if let Some(rv) = meta.get("resourceVersion").and_then(|v| v.as_str()) {
+            println!("Version: {rv}");
+        }
+    }
+    if let Some(spec) = obj.object.get("spec") {
+        println!("Spec:\n{}", serde_json::to_string_pretty(spec)?);
+    }
+    if let Some(status) = obj.object.get("status") {
+        println!("Status:\n{}", serde_json::to_string_pretty(status)?);
+    }
+    Ok(())
+}
+
+/// `starling ci`: bring the project up headless (no daemon/proxy), wait for it
+/// to settle, and exit 0 if everything came up, non-zero on failure/timeout.
+async fn ci(args: CiArgs) -> ! {
+    let config_path = resolve_config(args.file.as_deref());
+    let result = match starlingfile::load_with_options(
+        &config_path,
+        starlingfile::LoadOptions {
+            args: args.tiltfile_args.clone(),
+            ..starlingfile::LoadOptions::default()
+        },
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("starling ci: failed to load {}: {e}", config_path.display());
+            std::process::exit(1);
+        }
+    };
+    let expected = result.manifests.len();
+    let max_parallel_updates = result.max_parallel_updates;
+    // --timeout overrides ci_settings(timeout=...), which defaults to 300s.
+    let timeout_secs = args.timeout.or(result.ci_timeout_secs).unwrap_or(300);
+
+    // Headless engine: no daemon, no proxy. Keep the control-channel senders
+    // alive so the engine's select loop doesn't spin on closed receivers.
+    let (build_tx, build_rx) = mpsc::unbounded_channel::<store::BuildRequest>();
+    let (_restart_tx, restart_rx) = mpsc::unbounded_channel::<String>();
+    let (_tiltfile_args_tx, tiltfile_args_rx) = mpsc::unbounded_channel::<Vec<String>>();
+    let (_port_tx, port_rx) = mpsc::unbounded_channel::<(String, u16)>();
+    let store = Arc::new(Store::new(build_tx.clone()));
+    let api_objects = Arc::new(api::store::ApiObjectStore::new());
+    let eng = engine::Engine::new(
+        store.clone(),
+        result.manifests,
+        build_rx,
+        build_tx.clone(),
+        args.dry_run,
+        config_path.clone(),
+        args.tiltfile_args.clone(),
+        result.config_files,
+        result.port_leases,
+        restart_rx,
+        tiltfile_args_rx,
+        port_rx,
+        None,
+        api_objects,
+        max_parallel_updates,
+    );
+    tokio::spawn(eng.run());
+
+    println!("starling ci: bringing up {} ...", config_path.display());
+    let mut elapsed_ms = 0u64;
+    let timeout_ms = timeout_secs.saturating_mul(1000);
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        elapsed_ms += 250;
+        let view = store.full_view();
+        // Wait until every expected resource has materialized before judging,
+        // so an empty initial view isn't mistaken for "done".
+        if view.ui_resources.len() >= expected {
+            match ci::ci_outcome(&view.ui_resources) {
+                ci::CiOutcome::Done => {
+                    println!("starling ci: all {expected} resource(s) are up.");
+                    std::process::exit(0);
+                }
+                ci::CiOutcome::Failed => {
+                    eprintln!("starling ci: one or more resources failed:");
+                    for r in &view.ui_resources {
+                        let st = r.status.as_ref();
+                        let update = st
+                            .and_then(|s| s.update_status.as_deref())
+                            .unwrap_or("none");
+                        let runtime = st
+                            .and_then(|s| s.runtime_status.as_deref())
+                            .unwrap_or("none");
+                        if update == "error" || runtime == "error" {
+                            let name = r
+                                .metadata
+                                .as_ref()
+                                .map(|m| m.name.as_str())
+                                .unwrap_or("(unknown)");
+                            eprintln!("  {name}: update={update} runtime={runtime}");
+                        }
+                    }
+                    std::process::exit(1);
+                }
+                ci::CiOutcome::Pending => {}
+            }
+        }
+        if elapsed_ms >= timeout_ms {
+            eprintln!("starling ci: timed out after {timeout_secs}s before all resources settled");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `starling dump <target>`: print internal state as JSON to stdout.
+async fn dump(args: DumpArgs) -> anyhow::Result<()> {
+    let client = DaemonClient::new();
+    match args.target {
+        DumpTarget::State => {
+            let Response::State(state) = client.call(&Request::GetState).await? else {
+                anyhow::bail!("could not query daemon state");
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "proxyPort": state.proxy_port,
+                    "tld": state.tld,
+                    "instances": state.instances,
+                    "routes": state.routes,
+                }))?
+            );
+        }
+        DumpTarget::Objects => {
+            let Response::Objects(objects) =
+                client.call(&Request::GetObjects { kind: None }).await?
+            else {
+                anyhow::bail!("could not query daemon objects");
+            };
+            let items: Vec<_> = objects.into_iter().map(|o| o.object).collect();
+            println!("{}", serde_json::to_string_pretty(&items)?);
+        }
+        DumpTarget::Openapi => {
+            // Generated locally; no daemon needed.
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&api::store::openapi_document())?
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `starling snapshot`: write the current aggregated dashboard state (instances,
+/// resources, routes) to a JSON file for sharing/inspection.
+async fn write_snapshot(args: SnapshotArgs) -> anyhow::Result<()> {
+    let client = DaemonClient::new();
+    let Response::State(state) = client.call(&Request::GetState).await? else {
+        anyhow::bail!("could not query daemon state");
+    };
+    let json = serde_json::to_string_pretty(&serde_json::json!({
+        "proxyPort": state.proxy_port,
+        "tld": state.tld,
+        "instances": state.instances,
+        "routes": state.routes,
+    }))?;
+    std::fs::write(&args.out, json)
+        .map_err(|e| anyhow::anyhow!("writing snapshot to {}: {e}", args.out))?;
+    println!("Wrote snapshot to {}", args.out);
+    Ok(())
+}
+
+/// `starling explain [kind]`: describe an API object kind's spec fields, or list
+/// the available kinds when no kind is given.
+fn explain(args: ExplainArgs) -> anyhow::Result<()> {
+    let Some(kind) = args.kind else {
+        println!("Object kinds (use `starling explain <kind>`):");
+        for k in api::store::known_kinds() {
+            println!("  {k}");
+        }
+        return Ok(());
+    };
+    // Case-insensitive match against the known kinds.
+    let resolved = api::store::known_kinds()
+        .into_iter()
+        .find(|k| k.eq_ignore_ascii_case(&kind));
+    let Some(resolved) = resolved else {
+        anyhow::bail!("unknown kind {kind:?} (try `starling explain` to list kinds)");
+    };
+    let fields = api::store::spec_fields(resolved).unwrap_or(&[]);
+    println!("{resolved} (tilt.dev/v1alpha1)");
+    println!("spec fields:");
+    for f in fields {
+        println!("  {f}");
+    }
+    Ok(())
+}
+
+/// `starling doctor`: print a diagnostic bundle — version, environment, daemon
+/// health, and any resources currently in an error state.
+async fn doctor() -> anyhow::Result<()> {
+    println!("starling {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "os/arch:  {}/{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    println!(
+        "kubectl:  {}",
+        if which_ok("kubectl") {
+            "found"
+        } else {
+            "not found"
+        }
+    );
+    println!(
+        "docker:   {}",
+        if which_ok("docker") {
+            "found"
+        } else {
+            "not found"
+        }
+    );
+
+    let client = DaemonClient::new();
+    if !client.is_running().await {
+        println!("daemon:   not running");
+        return Ok(());
+    }
+    let Response::State(state) = client.call(&Request::GetState).await? else {
+        anyhow::bail!("could not query daemon state");
+    };
+    println!(
+        "daemon:   running (proxy :{}  tld {})",
+        state.proxy_port, state.tld
+    );
+    println!(
+        "instances: {}  routes: {}",
+        state.instances.len(),
+        state.routes.len()
+    );
+
+    let mut problems = 0;
+    for inst in &state.instances {
+        for r in &inst.resources {
+            if r.update_status == "error" || r.runtime_status == "error" {
+                problems += 1;
+                println!(
+                    "  [error] {} / {} (update={}, runtime={})",
+                    inst.name, r.name, r.update_status, r.runtime_status
+                );
+            }
+        }
+    }
+    if problems == 0 {
+        println!("health:   all resources healthy");
+    } else {
+        println!("health:   {problems} resource(s) in error");
+    }
+    Ok(())
+}
+
+/// Whether `bin` is found on `PATH` (best-effort, for diagnostics).
+fn which_ok(bin: &str) -> bool {
+    std::process::Command::new(bin)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// `starling args`: replace the running instance's Tiltfile args and reload.
+async fn set_args(args: ArgsArgs) -> anyhow::Result<()> {
+    let config_path = resolve_config(args.file.as_deref());
+    let dir = project_dir(&config_path);
+    let client = DaemonClient::new();
+
+    let Response::State(state) = client.call(&Request::GetState).await? else {
+        anyhow::bail!("could not query daemon state");
+    };
+    let instances: Vec<String> = state
+        .instances
+        .iter()
+        .filter(|i| i.dir == dir)
+        .map(|i| i.id.clone())
+        .collect();
+    if instances.is_empty() {
+        anyhow::bail!("no running Starling instance found for {dir}");
+    }
+    for instance in instances {
+        match client
+            .call(&Request::SetTiltfileArgs {
+                instance,
+                args: args.tiltfile_args.clone(),
+            })
+            .await?
+        {
+            Response::Ok => {}
+            Response::Error(e) => anyhow::bail!("{e}"),
+            other => anyhow::bail!("unexpected daemon response: {other:?}"),
+        }
+    }
+    if args.tiltfile_args.is_empty() {
+        println!("Cleared Tiltfile args; reloading.");
+    } else {
+        println!("Set Tiltfile args to {:?}; reloading.", args.tiltfile_args);
+    }
+    Ok(())
+}
+
+enum ResourceAction {
+    Trigger,
+    Enable,
+    Disable,
+}
+
+/// Send a per-resource action (`trigger`/`enable`/`disable`) to every instance
+/// running the current project, via the daemon's command queue.
+async fn resource_command(args: ResourceArgs, action: ResourceAction) -> anyhow::Result<()> {
+    let config_path = resolve_config(args.file.as_deref());
+    let dir = project_dir(&config_path);
+    let client = DaemonClient::new();
+
+    let Response::State(state) = client.call(&Request::GetState).await? else {
+        anyhow::bail!("could not query daemon state");
+    };
+    let instances: Vec<String> = state
+        .instances
+        .iter()
+        .filter(|i| i.dir == dir)
+        .map(|i| i.id.clone())
+        .collect();
+    if instances.is_empty() {
+        anyhow::bail!("no running Starling instance found for {dir}");
+    }
+
+    let verb = match action {
+        ResourceAction::Trigger => "Triggered",
+        ResourceAction::Enable => "Enabled",
+        ResourceAction::Disable => "Disabled",
+    };
+    for instance in instances {
+        let req = match action {
+            ResourceAction::Trigger => Request::Trigger {
+                instance,
+                resource: args.resource.clone(),
+            },
+            ResourceAction::Enable => Request::SetPaused {
+                instance,
+                resource: args.resource.clone(),
+                paused: false,
+            },
+            ResourceAction::Disable => Request::SetPaused {
+                instance,
+                resource: args.resource.clone(),
+                paused: true,
+            },
+        };
+        match client.call(&req).await? {
+            Response::Ok => {}
+            Response::Error(e) => anyhow::bail!("{e}"),
+            other => anyhow::bail!("unexpected daemon response: {other:?}"),
+        }
+    }
+    println!("{verb} {}", args.resource);
+    Ok(())
 }
 
 async fn down(args: DownArgs) -> anyhow::Result<()> {
@@ -592,14 +1240,15 @@ async fn status(args: StatusArgs) -> anyhow::Result<()> {
             continue;
         }
         println!(
-            "  {:<28} {:<10} {:<12} {:<14} {:<8} {}",
-            "RESOURCE", "KIND", "UPDATE", "RUNTIME", "PROXY", "URL"
+            "  {:<28} {:<10} {:<8} {:<12} {:<14} {:<8} {}",
+            "RESOURCE", "KIND", "STATE", "UPDATE", "RUNTIME", "PROXY", "URL"
         );
         for res in &inst.resources {
             println!(
-                "  {:<28} {:<10} {:<12} {:<14} {:<8} {}",
+                "  {:<28} {:<10} {:<8} {:<12} {:<14} {:<8} {}",
                 res.name,
                 res.kind,
+                if res.paused { "paused" } else { "active" },
                 empty_dash(&res.update_status),
                 empty_dash(&res.runtime_status),
                 proxy_condition_label(res.proxy_status.as_deref()),
@@ -950,7 +1599,9 @@ fn launch_agent_path() -> anyhow::Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn daemon_service_installed() -> bool {
-    launch_agent_path().map(|path| path.exists()).unwrap_or(false)
+    launch_agent_path()
+        .map(|path| path.exists())
+        .unwrap_or(false)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1060,7 +1711,11 @@ async fn install_daemon_service(args: &DaemonArgs) -> anyhow::Result<()> {
     }
 
     std::fs::write(&path, daemon_service_plist(args)?)?;
-    let out = run_launchctl(&["bootstrap", &launchd_domain(), path.to_string_lossy().as_ref()])?;
+    let out = run_launchctl(&[
+        "bootstrap",
+        &launchd_domain(),
+        path.to_string_lossy().as_ref(),
+    ])?;
     if !out.status.success() {
         anyhow::bail!(
             "launchctl bootstrap failed: {}{}",
@@ -1070,7 +1725,10 @@ async fn install_daemon_service(args: &DaemonArgs) -> anyhow::Result<()> {
     }
     let _ = run_launchctl(&["kickstart", "-k", &launchd_target()]);
     wait_for_service_daemon().await?;
-    println!("Installed and started Starling daemon service at {}", path.display());
+    println!(
+        "Installed and started Starling daemon service at {}",
+        path.display()
+    );
     Ok(())
 }
 
@@ -1113,7 +1771,11 @@ async fn start_daemon_service() -> anyhow::Result<()> {
         );
     }
     if !service_loaded() {
-        let out = run_launchctl(&["bootstrap", &launchd_domain(), path.to_string_lossy().as_ref()])?;
+        let out = run_launchctl(&[
+            "bootstrap",
+            &launchd_domain(),
+            path.to_string_lossy().as_ref(),
+        ])?;
         if !out.status.success() {
             anyhow::bail!(
                 "launchctl bootstrap failed: {}{}",
@@ -1218,12 +1880,14 @@ async fn up(args: UpArgs) {
     let config_path = resolve_config(args.file.as_deref());
     let span = config_span(&config_path);
 
-    let (build_tx, build_rx) = mpsc::unbounded_channel::<String>();
+    let (build_tx, build_rx) = mpsc::unbounded_channel::<store::BuildRequest>();
     let (restart_tx, restart_rx) = mpsc::unbounded_channel::<String>();
+    let (tiltfile_args_tx, tiltfile_args_rx) = mpsc::unbounded_channel::<Vec<String>>();
     let (port_tx, port_rx) = mpsc::unbounded_channel::<(String, u16)>();
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
     let store = Arc::new(Store::new(build_tx.clone()));
     store.set_restart_tx(restart_tx);
+    store.set_tiltfile_args_tx(tiltfile_args_tx);
 
     // Set up the proxy handle: daemon (default), local (--no-daemon), or none.
     let mut daemon_instance: Option<(DaemonClient, String)> = None;
@@ -1284,8 +1948,22 @@ async fn up(args: UpArgs) {
         })
     };
 
+    // Custom-deploy delete commands to run on `starling down` (populated below,
+    // before the manifests move into the engine).
+    let mut k8s_down_specs = Vec::new();
+
+    // API object store, shared between the engine (which populates it) and the
+    // web server (which exposes read/watch routes over it).
+    let api_objects = Arc::new(api::store::ApiObjectStore::new());
+
     // Load the config (Starlingfile or Tiltfile) and start the engine.
-    match starlingfile::load(&config_path) {
+    match starlingfile::load_with_options(
+        &config_path,
+        starlingfile::LoadOptions {
+            args: args.tiltfile_args.clone(),
+            ..starlingfile::LoadOptions::default()
+        },
+    ) {
         Ok(result) => {
             store.append_log(
                 Some(&span),
@@ -1309,6 +1987,7 @@ async fn up(args: UpArgs) {
                     );
                 }
             }
+            k8s_down_specs = engine::k8s_down_specs(&result.manifests);
             let eng = engine::Engine::new(
                 store.clone(),
                 result.manifests,
@@ -1316,21 +1995,39 @@ async fn up(args: UpArgs) {
                 build_tx.clone(),
                 args.dry_run,
                 config_path.clone(),
+                args.tiltfile_args.clone(),
                 result.config_files,
                 result.port_leases,
                 restart_rx,
+                tiltfile_args_rx,
                 port_rx,
                 proxy_handle.clone(),
+                api_objects.clone(),
+                result.max_parallel_updates,
             );
+            store.set_scrub_secrets(result.secret_values.clone());
             tokio::spawn(eng.run());
+            store.apply_session_settings(result.team_id, &result.feature_flags);
+            for (name, path) in &result.extension_repos {
+                api_objects.apply(
+                    "ExtensionRepo",
+                    "default",
+                    name,
+                    serde_json::json!({ "spec": { "url": format!("file://{path}") } }),
+                );
+            }
+            for (reference, repo) in &result.extensions {
+                api_objects.apply(
+                    "Extension",
+                    "default",
+                    reference,
+                    serde_json::json!({ "spec": { "repoName": repo, "repoPath": reference } }),
+                );
+            }
         }
         Err(e) => {
             let msg = format!("Failed to load {}: {e}", config_path.display());
-            store.append_log(
-                Some(&span),
-                "ERROR",
-                &format!("{msg}\n"),
-            );
+            store.append_log(Some(&span), "ERROR", &format!("{msg}\n"));
             store.upsert_resource(config_error_resource(&span, &msg));
         }
     }
@@ -1340,6 +2037,7 @@ async fn up(args: UpArgs) {
         let store = store.clone();
         let port_tx = port_tx.clone();
         let shutdown_tx = shutdown_tx.clone();
+        let api_objects = api_objects.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(1000));
             // Segment count already pushed to the daemon; only newer lines go
@@ -1353,11 +2051,21 @@ async fn up(args: UpArgs) {
                 let (logs_by_resource, checkpoint) = store.logs_since(log_checkpoint);
                 log_checkpoint = checkpoint;
                 let logs: HashMap<String, Vec<String>> = logs_by_resource.into_iter().collect();
+                let objects = api_objects
+                    .all()
+                    .into_iter()
+                    .map(|o| ApiObjectSnapshot {
+                        kind: o.kind,
+                        name: o.name,
+                        object: o.object,
+                    })
+                    .collect();
                 let _ = client
                     .call(&Request::Update {
                         instance: instance.clone(),
                         resources,
                         logs,
+                        objects,
                     })
                     .await;
                 if let Ok(Response::Commands(cmds)) = client
@@ -1377,6 +2085,22 @@ async fn up(args: UpArgs) {
                             DaemonCommand::SetPort { resource, port } => {
                                 let _ = port_tx.send((resource, port));
                             }
+                            DaemonCommand::SetPaused { resource, paused } => {
+                                if store.resource_exists(&resource) {
+                                    store.set_resource_disabled(&resource, paused);
+                                    store.append_log(
+                                        Some(&resource),
+                                        "INFO",
+                                        &format!(
+                                            "{} via dashboard\n",
+                                            if paused { "Paused" } else { "Resumed" }
+                                        ),
+                                    );
+                                }
+                            }
+                            DaemonCommand::SetTiltfileArgs { args } => {
+                                let _ = store.set_tiltfile_args(args);
+                            }
                             DaemonCommand::Shutdown => {
                                 let _ = shutdown_tx.send(());
                                 return;
@@ -1393,6 +2117,7 @@ async fn up(args: UpArgs) {
         let state = AppState {
             store: store.clone(),
             csrf_token: uuid::Uuid::new_v4().to_string(),
+            api_objects: api_objects.clone(),
         };
         let app = server::router(state, &args.web_dir);
         let addr = format!("{}:{}", args.host, args.port);
@@ -1413,11 +2138,39 @@ async fn up(args: UpArgs) {
 
     println!("starling up running — open the dashboard with `starling`. Ctrl-C to stop.");
 
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = shutdown_rx.recv() => {}
+    // A daemon-queued Shutdown (from `starling down` / `daemon --shutdown`) tears
+    // down deployed resources; Ctrl-C leaves them running, matching Tilt.
+    let down_requested = tokio::select! {
+        _ = tokio::signal::ctrl_c() => false,
+        _ = shutdown_rx.recv() => true,
+    };
+    if down_requested && !k8s_down_specs.is_empty() {
+        println!("Running k8s_custom_deploy delete commands...");
+        engine::run_k8s_down(&k8s_down_specs, &store, args.dry_run).await;
     }
     if let Some((client, instance)) = daemon_instance {
         let _ = client.call(&Request::Deregister { instance }).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explain_knows_core_kinds() {
+        // Every known kind has a (possibly empty) field list, and a couple of
+        // representative kinds expose the expected spec fields.
+        for k in api::store::known_kinds() {
+            assert!(
+                api::store::spec_fields(k).is_some(),
+                "missing fields for {k}"
+            );
+        }
+        assert!(api::store::spec_fields("KubernetesApply")
+            .unwrap()
+            .contains(&"yaml"));
+        assert!(api::store::spec_fields("Cmd").unwrap().contains(&"args"));
+        assert!(api::store::spec_fields("NotAKind").is_none());
     }
 }

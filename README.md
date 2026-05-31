@@ -36,7 +36,10 @@ daemon** with a **k9s-style TUI dashboard**.
   running instance's resources.
 - `starling up` runs the **engine** for one project (executes real
   Starlingfiles, watches files, runs `local_resource` commands, builds docker
-  images, applies Kubernetes manifests) and reports to the daemon.
+  images, applies Kubernetes manifests) and reports to the daemon. File-change
+  rebuilds honor `.tiltignore`, `watch_settings(ignore=...)`, and
+  `local_resource(ignore=...)`; Docker build contexts honor `.dockerignore`,
+  `docker_build(ignore=...)`, and `docker_build(only=...)`.
 - `starling` (or `starling dash`) opens a **k9s-style terminal dashboard** of
   every instance's resources, with live logs and trigger.
 
@@ -115,7 +118,9 @@ not yet a drop-in replacement for all of Tilt — see the roadmap below.
     `kustomize`, `helm`, `docker_compose`, `port_forward`, live_update steps
     (`sync`/`run`/`fall_back_on`/`restart_container`/`initial_sync`), `include`,
     `load()`, `load_dynamic`, `default_registry`, `allow_k8s_contexts`,
-    `k8s_kind`, plus the `alias` extension. `TRIGGER_MODE_AUTO`/`_MANUAL` constants.
+    `k8s_kind`, `k8s_context`, `k8s_namespace`, common settings builtins, plus
+    deprecated `test(...)` resources and the `alias` extension.
+    `TRIGGER_MODE_AUTO`/`_MANUAL` constants.
   - `k8s.rs` — multi-doc YAML parsing → workloads, container images, selectors.
   - `proxy.rs` — embedded named-URL reverse proxy (ported from portless): a
     Host-header router mapping `<name>.<tld>` → `127.0.0.1:<port>`, with
@@ -142,7 +147,7 @@ not yet a drop-in replacement for all of Tilt — see the roadmap below.
 | GET | `/api/snapshot/:id` | a `Snapshot` wrapping the view |
 | POST | `/api/trigger` | queue a build (`{manifest_names, build_reason}`) |
 | POST | `/api/override/trigger_mode` | set trigger mode on manifests |
-| POST | `/api/set_tiltfile_args` | replace Starlingfile args (route name fixed by the frontend) |
+| POST | `/api/set_tiltfile_args` | replace Starlingfile args and reload the running engine |
 | POST | `/api/analytics` / `/api/analytics_opt` | accepted, no-op |
 | * | (fallback) | static frontend assets with SPA index fallback |
 
@@ -158,6 +163,7 @@ cargo install starling-devex          # installs the `starling` command
 # In each project directory (auto-starts the daemon on first run):
 cargo run -- up                       # or: starling up
 cargo run -- up --file path/to/Starlingfile
+cargo run -- up -- frontend --mode dev # Tiltfile args for config.parse()/resource selection
 cargo run -- up --dry-run             # k8s applies use --dry-run=client (safe)
 cargo run -- down                     # stop the instance for this project
 cargo run -- down --file path/to/Starlingfile

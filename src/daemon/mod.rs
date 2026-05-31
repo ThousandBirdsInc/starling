@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 
@@ -97,17 +98,43 @@ pub async fn run(proxy_port: u16, tld: String, host: String, tls: bool, lan: boo
         println!("starling daemon already running at {}", sock.display());
         return;
     }
-    // Clear a stale socket file.
-    if sock.exists() {
-        std::fs::remove_file(&sock).ok();
-    }
-
-    let listener = match UnixListener::bind(&sock) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("daemon: failed to bind {}: {e}", sock.display());
-            return;
+    // Transport: a Unix domain socket on Unix; a 127.0.0.1 TCP port on Windows
+    // (which has no AF_UNIX in tokio), with the chosen port recorded for the
+    // client. Both listeners expose the same `.accept()` shape, and `handle_conn`
+    // is generic over the stream type.
+    #[cfg(unix)]
+    let listener = {
+        // Clear a stale socket file.
+        if sock.exists() {
+            std::fs::remove_file(&sock).ok();
         }
+        match UnixListener::bind(&sock) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("daemon: failed to bind {}: {e}", sock.display());
+                return;
+            }
+        }
+    };
+    #[cfg(windows)]
+    let listener = {
+        let l = match tokio::net::TcpListener::bind(("127.0.0.1", 0u16)).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("daemon: failed to bind 127.0.0.1: {e}");
+                return;
+            }
+        };
+        match l.local_addr() {
+            Ok(addr) => {
+                std::fs::write(port_file_path(), addr.port().to_string()).ok();
+            }
+            Err(e) => {
+                eprintln!("daemon: cannot read local addr: {e}");
+                return;
+            }
+        }
+        l
     };
     std::fs::write(pid_path(), std::process::id().to_string()).ok();
 
@@ -148,11 +175,11 @@ pub async fn run(proxy_port: u16, tld: String, host: String, tls: bool, lan: boo
         lan_ip,
     });
 
-    println!(
-        "starling daemon listening on {} (shared proxy :{})",
-        sock.display(),
-        proxy_port
-    );
+    #[cfg(unix)]
+    let endpoint = sock.display().to_string();
+    #[cfg(windows)]
+    let endpoint = format!("127.0.0.1 (port in {})", port_file_path().display());
+    println!("starling daemon listening on {endpoint} (shared proxy :{proxy_port})");
 
     loop {
         match listener.accept().await {
@@ -169,8 +196,11 @@ pub async fn run(proxy_port: u16, tld: String, host: String, tls: bool, lan: boo
     }
 }
 
-async fn handle_conn(stream: tokio::net::UnixStream, daemon: Arc<Daemon>) -> std::io::Result<()> {
-    let (read_half, mut write_half) = stream.into_split();
+async fn handle_conn<S>(stream: S, daemon: Arc<Daemon>) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
     if reader.read_line(&mut line).await? == 0 {
@@ -204,6 +234,7 @@ impl Daemon {
                             dir,
                             pid,
                             resources: vec![],
+                            objects: vec![],
                         },
                         logs: HashMap::new(),
                         commands: vec![],
@@ -227,10 +258,12 @@ impl Daemon {
                 instance,
                 resources,
                 logs,
+                objects,
             } => {
                 let mut inner = self.inner.lock().await;
                 if let Some(inst) = inner.instances.get_mut(&instance) {
                     inst.state.resources = resources;
+                    inst.state.objects = objects;
                     inst.last_seen = Instant::now();
                     // The reporter sends only lines appended since its last
                     // push, so append (don't replace) to preserve scrollback
@@ -336,6 +369,22 @@ impl Daemon {
                 })
             }
 
+            Request::GetObjects { kind } => {
+                let mut inner = self.inner.lock().await;
+                self.prune(&mut inner);
+                let mut objects: Vec<_> = inner
+                    .instances
+                    .values()
+                    .flat_map(|i| i.state.objects.iter())
+                    .filter(|o| kind.as_ref().is_none_or(|k| o.kind.eq_ignore_ascii_case(k)))
+                    .cloned()
+                    .collect();
+                objects.sort_by(|a, b| {
+                    (a.kind.clone(), a.name.clone()).cmp(&(b.kind.clone(), b.name.clone()))
+                });
+                Response::Objects(objects)
+            }
+
             Request::GetLogs {
                 instance,
                 resource,
@@ -371,6 +420,16 @@ impl Daemon {
                 }
             }
 
+            Request::SetTiltfileArgs { instance, args } => {
+                let mut inner = self.inner.lock().await;
+                if let Some(inst) = inner.instances.get_mut(&instance) {
+                    inst.commands.push(Command::SetTiltfileArgs { args });
+                    Response::Ok
+                } else {
+                    Response::Error(format!("unknown instance {instance}"))
+                }
+            }
+
             Request::Restart { instance, resource } => {
                 let mut inner = self.inner.lock().await;
                 if let Some(inst) = inner.instances.get_mut(&instance) {
@@ -389,6 +448,20 @@ impl Daemon {
                 let mut inner = self.inner.lock().await;
                 if let Some(inst) = inner.instances.get_mut(&instance) {
                     inst.commands.push(Command::SetPort { resource, port });
+                    Response::Ok
+                } else {
+                    Response::Error(format!("unknown instance {instance}"))
+                }
+            }
+
+            Request::SetPaused {
+                instance,
+                resource,
+                paused,
+            } => {
+                let mut inner = self.inner.lock().await;
+                if let Some(inst) = inner.instances.get_mut(&instance) {
+                    inst.commands.push(Command::SetPaused { resource, paused });
                     Response::Ok
                 } else {
                     Response::Error(format!("unknown instance {instance}"))
