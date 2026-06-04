@@ -1438,6 +1438,7 @@ impl Engine {
         if ok && !self.dry_run && !m.pod_selector.is_empty() {
             self.spawn_pod_watch(
                 name.to_string(),
+                m.namespace.clone(),
                 m.pod_selector.clone(),
                 m.pod_readiness_ignore,
                 m.live_update.clone(),
@@ -1479,6 +1480,8 @@ impl Engine {
                     );
                     vec![
                         "kubectl".to_string(),
+                        "-n".to_string(),
+                        m.namespace.clone(),
                         "cp".to_string(),
                         local.clone(),
                         format!("{pod}:{remote}"),
@@ -1511,6 +1514,8 @@ impl Engine {
                     );
                     vec![
                         "kubectl".to_string(),
+                        "-n".to_string(),
+                        m.namespace.clone(),
                         "exec".to_string(),
                         pod.to_string(),
                         "--".to_string(),
@@ -1526,6 +1531,8 @@ impl Engine {
                         .append_log(Some(&span), "INFO", "  restart_container\n");
                     vec![
                         "kubectl".to_string(),
+                        "-n".to_string(),
+                        m.namespace.clone(),
                         "delete".to_string(),
                         "pod".to_string(),
                         pod.to_string(),
@@ -1580,6 +1587,7 @@ impl Engine {
     fn spawn_pod_watch(
         &self,
         name: String,
+        namespace: String,
         selector: std::collections::BTreeMap<String, String>,
         readiness_ignored: bool,
         live_update: Vec<crate::starlingfile::LiveUpdateStep>,
@@ -1601,7 +1609,7 @@ impl Engine {
             let mut port_forward_tasks: Vec<tokio::task::JoinHandle<()>> = vec![];
             loop {
                 let out = Command::new("kubectl")
-                    .args(["get", "pods", "-l", &sel, "-o", "json"])
+                    .args(["get", "pods", "-n", &namespace, "-l", &sel, "-o", "json"])
                     .output()
                     .await;
                 let Ok(out) = out else {
@@ -1638,6 +1646,7 @@ impl Engine {
                             tokio::spawn(run_initial_sync(
                                 store.clone(),
                                 name.clone(),
+                                namespace.clone(),
                                 pn,
                                 live_update.clone(),
                             ));
@@ -1660,6 +1669,7 @@ impl Engine {
                             for spec in port_forwards.clone() {
                                 port_forward_tasks.push(stream_port_forward(
                                     pod_name.clone(),
+                                    namespace.clone(),
                                     name.clone(),
                                     spec,
                                     store.clone(),
@@ -2343,12 +2353,15 @@ pub async fn reconcile_kubernetes_apply(
 /// pods -o json`. Both return the items as the same Kubernetes JSON shape, so
 /// callers (`aggregate_pod_status`, `pod_record`, target resolution) are
 /// transport-agnostic.
-async fn list_pods_for_selector(selector: &str) -> Result<Vec<serde_json::Value>, String> {
+async fn list_pods_for_selector(
+    selector: &str,
+    namespace: &str,
+) -> Result<Vec<serde_json::Value>, String> {
     if crate::kube_client::use_kube_rs() {
-        return crate::kube_client::list_pods(selector).await;
+        return crate::kube_client::list_pods(selector, namespace).await;
     }
     let out = Command::new("kubectl")
-        .args(["get", "pods", "-l", selector, "-o", "json"])
+        .args(["get", "pods", "-n", namespace, "-l", selector, "-o", "json"])
         .output()
         .await
         .map_err(|e| format!("kubectl get pods: {e}"))?;
@@ -2379,7 +2392,8 @@ pub async fn reconcile_kubernetes_discovery(
     if selector.is_empty() {
         return Err(format!("KubernetesDiscovery {name} has no selector"));
     }
-    let items = list_pods_for_selector(&selector).await?;
+    let namespace = object_namespace(&obj.object);
+    let items = list_pods_for_selector(&selector, &namespace).await?;
     let summary = aggregate_pod_status(&items, false);
     let _ = api.patch(
         "KubernetesDiscovery",
@@ -2461,7 +2475,8 @@ pub async fn reconcile_pod_watch(
     if selector.is_empty() {
         return Err(format!("KubernetesDiscovery {name} has no selector"));
     }
-    let items = list_pods_for_selector(&selector).await?;
+    let namespace = object_namespace(&obj.object);
+    let items = list_pods_for_selector(&selector, &namespace).await?;
     let pods: Vec<serde_json::Value> = items.iter().map(pod_record).collect();
     let _ = api.patch(
         "KubernetesDiscovery",
@@ -2553,17 +2568,28 @@ pub fn spawn_controller_manager(
                 if selector.is_empty() {
                     continue;
                 }
-                let pods = list_pods_for_selector(&selector).await.unwrap_or_default();
+                let namespace = object_namespace(&obj.object);
+                let pods = list_pods_for_selector(&selector, &namespace)
+                    .await
+                    .unwrap_or_default();
                 for p in &pods {
                     let pod = p["metadata"]["name"].as_str().unwrap_or("").to_string();
                     if pod.is_empty() {
                         continue;
                     }
-                    live_log_pods.insert(pod.clone());
+                    // Key by namespace/pod so identically-named pods in different
+                    // namespaces are followed independently.
+                    let key = format!("{namespace}/{pod}");
+                    live_log_pods.insert(key.clone());
                     // Start a follow stream the first time we see this pod; logs
                     // go to the resource span (the PodLogStream object's name).
-                    log_follows.entry(pod.clone()).or_insert_with(|| {
-                        stream_pod_logs(pod.clone(), obj.name.clone(), store.clone())
+                    log_follows.entry(key).or_insert_with(|| {
+                        stream_pod_logs(
+                            pod.clone(),
+                            namespace.clone(),
+                            obj.name.clone(),
+                            store.clone(),
+                        )
                     });
                 }
             }
@@ -2589,6 +2615,7 @@ pub fn spawn_controller_manager(
                     .as_str()
                     .unwrap_or("")
                     .to_string();
+                let namespace = object_namespace(&current.object);
                 let specs = port_forward_specs_from_object(&current.object);
                 if pod.is_empty() || specs.is_empty() {
                     continue;
@@ -2602,7 +2629,13 @@ pub fn spawn_controller_manager(
                     let tasks = specs
                         .into_iter()
                         .map(|spec| {
-                            stream_port_forward(pod.clone(), obj.name.clone(), spec, store.clone())
+                            stream_port_forward(
+                                pod.clone(),
+                                namespace.clone(),
+                                obj.name.clone(),
+                                spec,
+                                store.clone(),
+                            )
                         })
                         .collect();
                     // Replacing the entry drops the old one, aborting its tasks.
@@ -2639,7 +2672,8 @@ pub async fn reconcile_port_forward(
     if selector.is_empty() {
         return Err(format!("PortForward {name} has no selector"));
     }
-    let items = list_pods_for_selector(&selector).await?;
+    let namespace = object_namespace(&obj.object);
+    let items = list_pods_for_selector(&selector, &namespace).await?;
     let pod = items
         .first()
         .and_then(|p| p["metadata"]["name"].as_str())
@@ -2680,7 +2714,8 @@ pub async fn reconcile_live_update(
     if selector.is_empty() {
         return Err(format!("LiveUpdate {name} has no selector"));
     }
-    let items = list_pods_for_selector(&selector).await?;
+    let namespace = object_namespace(&obj.object);
+    let items = list_pods_for_selector(&selector, &namespace).await?;
     let pod = items
         .first()
         .and_then(|p| p["metadata"]["name"].as_str())
@@ -2708,10 +2743,10 @@ pub async fn reconcile_live_update(
             continue;
         }
         let result = if use_kube_rs {
-            crate::kube_client::copy_file(&pod, local, remote).await
+            crate::kube_client::copy_file(&namespace, &pod, local, remote).await
         } else {
             Command::new("kubectl")
-                .args(["cp", local, &format!("{pod}:{remote}")])
+                .args(["cp", "-n", &namespace, local, &format!("{pod}:{remote}")])
                 .output()
                 .await
                 .map_err(|e| format!("kubectl cp: {e}"))
@@ -2745,9 +2780,15 @@ pub async fn reconcile_live_update(
             }
             let sh = vec!["sh".to_string(), "-c".to_string(), args.join(" ")];
             let result = if use_kube_rs {
-                crate::kube_client::exec(&pod, &sh).await
+                crate::kube_client::exec(&namespace, &pod, &sh).await
             } else {
-                let mut argv = vec!["exec".to_string(), pod.clone(), "--".to_string()];
+                let mut argv = vec![
+                    "exec".to_string(),
+                    "-n".to_string(),
+                    namespace.clone(),
+                    pod.clone(),
+                    "--".to_string(),
+                ];
                 argv.extend(sh);
                 Command::new("kubectl")
                     .args(&argv)
@@ -2792,6 +2833,18 @@ pub async fn reconcile_live_update(
 
 /// Build a `key=value,...` label selector string from an object's
 /// `spec.selector.matchLabels`.
+/// Read `spec.namespace` from an API object, defaulting to "default" when unset
+/// or empty. All pod discovery / log / port-forward operations are scoped to it,
+/// so resources deployed to a non-default namespace (e.g. a Helm chart's) are
+/// found rather than silently missed.
+fn object_namespace(object: &serde_json::Value) -> String {
+    object["spec"]["namespace"]
+        .as_str()
+        .filter(|ns| !ns.is_empty())
+        .unwrap_or("default")
+        .to_string()
+}
+
 fn pod_log_selector(object: &serde_json::Value) -> String {
     object["spec"]["selector"]["matchLabels"]
         .as_object()
@@ -2828,12 +2881,15 @@ pub async fn reconcile_pod_log_stream(
     if selector.is_empty() {
         return Err(format!("PodLogStream {name} has no selector"));
     }
+    let namespace = object_namespace(&obj.object);
     let text = if crate::kube_client::use_kube_rs() {
-        crate::kube_client::pod_logs(&selector, 50).await?
+        crate::kube_client::pod_logs(&selector, &namespace, 50).await?
     } else {
         let out = Command::new("kubectl")
             .args([
                 "logs",
+                "-n",
+                &namespace,
                 "-l",
                 &selector,
                 "--tail=50",
@@ -2986,11 +3042,16 @@ fn aggregate_pod_status(items: &[serde_json::Value], readiness_ignored: bool) ->
 }
 
 /// Stream a pod's logs (`kubectl logs -f`) into the resource span.
-fn stream_pod_logs(pod: String, span: String, store: Arc<Store>) -> tokio::task::JoinHandle<()> {
+fn stream_pod_logs(
+    pod: String,
+    namespace: String,
+    span: String,
+    store: Arc<Store>,
+) -> tokio::task::JoinHandle<()> {
     // Typed `Api::log_stream` follow under kube-rs, else `kubectl logs -f`.
     if crate::kube_client::use_kube_rs() {
         return tokio::spawn(async move {
-            match crate::kube_client::log_stream(&pod, 20).await {
+            match crate::kube_client::log_stream(&pod, &namespace, 20).await {
                 Ok(reader) => stream_lines(reader, store, span, "INFO", None),
                 Err(e) => store.append_log(Some(&span), "ERROR", &format!("log stream: {e}\n")),
             }
@@ -2998,7 +3059,16 @@ fn stream_pod_logs(pod: String, span: String, store: Arc<Store>) -> tokio::task:
     }
     tokio::spawn(async move {
         let mut child = match Command::new("kubectl")
-            .args(["logs", "-f", "--all-containers", "--tail", "20", &pod])
+            .args([
+                "logs",
+                "-n",
+                &namespace,
+                "-f",
+                "--all-containers",
+                "--tail",
+                "20",
+                &pod,
+            ])
             .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -3014,9 +3084,11 @@ fn stream_pod_logs(pod: String, span: String, store: Arc<Store>) -> tokio::task:
     })
 }
 
-fn port_forward_args(pod: &str, spec: &PortForwardSpec) -> Vec<String> {
+fn port_forward_args(pod: &str, namespace: &str, spec: &PortForwardSpec) -> Vec<String> {
     vec![
         "port-forward".to_string(),
+        "-n".to_string(),
+        namespace.to_string(),
         format!("pod/{pod}"),
         format!("{}:{}", spec.local_port, spec.container_port),
         "--address".to_string(),
@@ -3026,6 +3098,7 @@ fn port_forward_args(pod: &str, spec: &PortForwardSpec) -> Vec<String> {
 
 fn stream_port_forward(
     pod: String,
+    namespace: String,
     resource: String,
     spec: PortForwardSpec,
     store: Arc<Store>,
@@ -3043,6 +3116,7 @@ fn stream_port_forward(
         // a `kubectl port-forward` child process.
         if crate::kube_client::use_kube_rs() {
             if let Err(e) = crate::kube_client::port_forward_listener(
+                namespace.clone(),
                 pod.clone(),
                 spec.host.clone(),
                 spec.local_port,
@@ -3059,7 +3133,7 @@ fn stream_port_forward(
             return;
         }
         let mut child = match Command::new("kubectl")
-            .args(port_forward_args(&pod, &spec))
+            .args(port_forward_args(&pod, &namespace, &spec))
             .kill_on_drop(true)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -3225,6 +3299,7 @@ fn port_forward_object(m: &Manifest) -> serde_json::Value {
         .collect();
     serde_json::json!({
         "spec": {
+            "namespace": m.namespace,
             "forwards": forwards,
             "selector": { "matchLabels": serde_json::Value::Object(match_labels) },
         }
@@ -3261,6 +3336,7 @@ fn live_update_object(m: &Manifest) -> serde_json::Value {
         .collect();
     serde_json::json!({
         "spec": {
+            "namespace": m.namespace,
             "syncs": syncs,
             "execs": execs,
             "stopPaths": stop_paths,
@@ -3331,7 +3407,10 @@ fn kubernetes_discovery_object(m: &Manifest) -> serde_json::Value {
         .map(|(k, v)| (k.clone(), serde_json::json!(v)))
         .collect();
     serde_json::json!({
-        "spec": { "selectors": [{ "matchLabels": serde_json::Value::Object(match_labels) }] },
+        "spec": {
+            "namespace": m.namespace,
+            "selectors": [{ "matchLabels": serde_json::Value::Object(match_labels) }],
+        },
     })
 }
 
@@ -3525,7 +3604,10 @@ fn pod_log_stream_object(m: &Manifest) -> serde_json::Value {
         .map(|(k, v)| (k.clone(), serde_json::json!(v)))
         .collect();
     serde_json::json!({
-        "spec": { "selector": { "matchLabels": serde_json::Value::Object(match_labels) } },
+        "spec": {
+            "namespace": m.namespace,
+            "selector": { "matchLabels": serde_json::Value::Object(match_labels) },
+        },
     })
 }
 
@@ -4113,6 +4195,7 @@ fn live_update_has_initial_sync(steps: &[crate::starlingfile::LiveUpdateStep]) -
 
 fn initial_sync_command(
     step: &crate::starlingfile::LiveUpdateStep,
+    namespace: &str,
     pod: &str,
 ) -> Option<(Cmd, String)> {
     match step {
@@ -4120,6 +4203,8 @@ fn initial_sync_command(
             Cmd {
                 argv: vec![
                     "kubectl".to_string(),
+                    "-n".to_string(),
+                    namespace.to_string(),
                     "cp".to_string(),
                     local.clone(),
                     format!("{pod}:{remote}"),
@@ -4133,6 +4218,8 @@ fn initial_sync_command(
             Cmd {
                 argv: vec![
                     "kubectl".to_string(),
+                    "-n".to_string(),
+                    namespace.to_string(),
                     "exec".to_string(),
                     pod.to_string(),
                     "--".to_string(),
@@ -4159,12 +4246,13 @@ fn initial_sync_command(
 async fn run_initial_sync(
     store: Arc<Store>,
     name: String,
+    namespace: String,
     pod: String,
     steps: Vec<crate::starlingfile::LiveUpdateStep>,
 ) {
     store.append_log(Some(&name), "INFO", "Initial sync started\n");
     for step in &steps {
-        let Some((cmd, log)) = initial_sync_command(step, &pod) else {
+        let Some((cmd, log)) = initial_sync_command(step, &namespace, &pod) else {
             continue;
         };
         store.append_log(Some(&name), "INFO", &log);
@@ -5592,6 +5680,7 @@ spec:
         unsafe { std::env::set_var("STARLING_KUBE_RS", "1") };
         let handle = stream_port_forward(
             "starling-kpf".to_string(),
+            "default".to_string(),
             "starling-kpf".to_string(),
             spec,
             store.clone(),
@@ -5964,7 +6053,7 @@ spec:
         // Poll the typed client until it observes the pod.
         let mut kube_pods = Vec::new();
         for _ in 0..30 {
-            kube_pods = crate::kube_client::list_pods("app=starling-kube")
+            kube_pods = crate::kube_client::list_pods("app=starling-kube", "default")
                 .await
                 .expect("kube-rs list_pods");
             if !kube_pods.is_empty() {
@@ -6353,6 +6442,7 @@ spec:
         unsafe { std::env::set_var("STARLING_KUBE_RS", "1") };
         stream_pod_logs(
             "starling-follow".to_string(),
+            "default".to_string(),
             "follow-span".to_string(),
             store.clone(),
         );
@@ -7177,17 +7267,27 @@ spec:
         ];
         assert!(live_update_has_initial_sync(&steps));
 
-        let (sync_cmd, _) = initial_sync_command(&steps[1], "pod-123").expect("sync command");
+        let (sync_cmd, _) =
+            initial_sync_command(&steps[1], "ns-x", "pod-123").expect("sync command");
         assert_eq!(
             sync_cmd.argv,
-            vec!["kubectl", "cp", "/repo/src", "pod-123:/app/src"]
+            vec![
+                "kubectl",
+                "-n",
+                "ns-x",
+                "cp",
+                "/repo/src",
+                "pod-123:/app/src"
+            ]
         );
 
-        let (run_cmd, _) = initial_sync_command(&steps[2], "pod-123").expect("run command");
+        let (run_cmd, _) = initial_sync_command(&steps[2], "ns-x", "pod-123").expect("run command");
         assert_eq!(
             run_cmd.argv,
             vec![
                 "kubectl",
+                "-n",
+                "ns-x",
                 "exec",
                 "pod-123",
                 "--",
@@ -7208,9 +7308,11 @@ spec:
             link_path: String::new(),
         };
         assert_eq!(
-            port_forward_args("web-pod", &spec),
+            port_forward_args("web-pod", "ns-x", &spec),
             vec![
                 "port-forward",
+                "-n",
+                "ns-x",
                 "pod/web-pod",
                 "8080:3000",
                 "--address",

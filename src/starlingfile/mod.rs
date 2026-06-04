@@ -4252,6 +4252,7 @@ fn assemble_k8s(st: &TfState) -> Vec<Manifest> {
         let mut m = Manifest::new(resource_name, TargetKind::Kubernetes);
         let mut apply_doc = e.raw.clone();
         m.k8s_workload = Some(format!("{}/{}", e.kind, e.name));
+        m.namespace = e.namespace.clone();
         m.pod_selector = e.match_labels.clone();
         if entity_matching_kind_configs(e, &kind_configs)
             .iter()

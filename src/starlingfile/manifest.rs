@@ -250,6 +250,11 @@ pub struct Manifest {
     pub docker_builds: Vec<DockerBuild>,
     /// `kind/name` of the primary workload (for status display).
     pub k8s_workload: Option<String>,
+    /// Namespace the workload (and its pods) live in. Derived from the applied
+    /// YAML's `metadata.namespace`, defaulting to "default" when unset. All pod
+    /// discovery / log following / port-forwarding for this resource is scoped to
+    /// this namespace.
+    pub namespace: String,
     /// Pod selector labels for watching pod status.
     pub pod_selector: std::collections::BTreeMap<String, String>,
     /// If true, pod readiness does not gate runtime status.
@@ -317,6 +322,7 @@ impl Manifest {
             k8s_apply_docs: vec![],
             docker_builds: vec![],
             k8s_workload: None,
+            namespace: "default".to_string(),
             pod_selector: std::collections::BTreeMap::new(),
             pod_readiness_ignore: false,
             k8s_custom_apply_cmd: None,

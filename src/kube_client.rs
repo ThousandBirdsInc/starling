@@ -23,15 +23,15 @@ pub fn use_kube_rs() -> bool {
     std::env::var("STARLING_KUBE_RS").as_deref() == Ok("1")
 }
 
-/// List the pods matching a `key=value,key2=value2` label selector in the
-/// `default` namespace via the typed client, returning each pod serialized to
-/// the same JSON shape `kubectl get pods -o json`'s `items` produce. The
-/// returned values therefore feed `aggregate_pod_status`/`pod_record` unchanged.
-pub async fn list_pods(selector: &str) -> Result<Vec<serde_json::Value>, String> {
+/// List the pods matching a `key=value,key2=value2` label selector in the given
+/// namespace via the typed client, returning each pod serialized to the same
+/// JSON shape `kubectl get pods -o json`'s `items` produce. The returned values
+/// therefore feed `aggregate_pod_status`/`pod_record` unchanged.
+pub async fn list_pods(selector: &str, namespace: &str) -> Result<Vec<serde_json::Value>, String> {
     let client = Client::try_default()
         .await
         .map_err(|e| format!("kube client: {e}"))?;
-    let pods: Api<Pod> = Api::default_namespaced(client);
+    let pods: Api<Pod> = Api::namespaced(client, namespace);
     let lp = ListParams::default().labels(selector);
     let list = pods
         .list(&lp)
@@ -46,11 +46,11 @@ pub async fn list_pods(selector: &str) -> Result<Vec<serde_json::Value>, String>
 /// Fetch recent logs (`tail` lines) for every pod matching a label selector via
 /// the typed client and concatenate them — the kube-rs equivalent of `kubectl
 /// logs -l <selector> --tail=<n> --all-containers`.
-pub async fn pod_logs(selector: &str, tail: i64) -> Result<String, String> {
+pub async fn pod_logs(selector: &str, namespace: &str, tail: i64) -> Result<String, String> {
     let client = Client::try_default()
         .await
         .map_err(|e| format!("kube client: {e}"))?;
-    let pods: Api<Pod> = Api::default_namespaced(client);
+    let pods: Api<Pod> = Api::namespaced(client, namespace);
     let list = pods
         .list(&ListParams::default().labels(selector))
         .await
@@ -76,12 +76,13 @@ pub async fn pod_logs(selector: &str, tail: i64) -> Result<String, String> {
 /// store. `tail` seeds the stream with the last N lines before following.
 pub async fn log_stream(
     pod: &str,
+    namespace: &str,
     tail: i64,
 ) -> Result<impl tokio::io::AsyncRead + Unpin + Send + 'static, String> {
     let client = Client::try_default()
         .await
         .map_err(|e| format!("kube client: {e}"))?;
-    let pods: Api<Pod> = Api::default_namespaced(client);
+    let pods: Api<Pod> = Api::namespaced(client, namespace);
     let lp = LogParams {
         follow: true,
         tail_lines: Some(tail),
@@ -101,6 +102,7 @@ pub async fn log_stream(
 /// until the task is aborted; returns only on a bind/accept error. Each
 /// connection is proxied with `copy_bidirectional`.
 pub async fn port_forward_listener(
+    namespace: String,
     pod: String,
     host: String,
     local_port: u16,
@@ -109,7 +111,7 @@ pub async fn port_forward_listener(
     let client = Client::try_default()
         .await
         .map_err(|e| format!("kube client: {e}"))?;
-    let pods: Api<Pod> = Api::default_namespaced(client);
+    let pods: Api<Pod> = Api::namespaced(client, &namespace);
     let listener = tokio::net::TcpListener::bind((host.as_str(), local_port))
         .await
         .map_err(|e| format!("bind {host}:{local_port}: {e}"))?;
@@ -212,11 +214,11 @@ fn attach_succeeded(
 /// Exec a command in a pod's first container via the WebSocket attach API (the
 /// typed equivalent of `kubectl exec pod -- <cmd>`). Drains stdout/stderr so the
 /// stream can close, then returns Ok only on a `Success` terminal status.
-pub async fn exec(pod: &str, cmd: &[String]) -> Result<(), String> {
+pub async fn exec(namespace: &str, pod: &str, cmd: &[String]) -> Result<(), String> {
     let client = Client::try_default()
         .await
         .map_err(|e| format!("kube client: {e}"))?;
-    let pods: Api<Pod> = Api::default_namespaced(client);
+    let pods: Api<Pod> = Api::namespaced(client, namespace);
     let ap = AttachParams::default()
         .stdin(false)
         .stdout(true)
@@ -243,12 +245,17 @@ pub async fn exec(pod: &str, cmd: &[String]) -> Result<(), String> {
 /// `sh -c 'cat > remote'` and streaming the file's bytes to the container's
 /// stdin — the same primitive `kubectl cp` uses, without the tar wrapper, which
 /// is sufficient for live-update's single-file syncs.
-pub async fn copy_file(pod: &str, local: &str, remote: &str) -> Result<(), String> {
+pub async fn copy_file(
+    namespace: &str,
+    pod: &str,
+    local: &str,
+    remote: &str,
+) -> Result<(), String> {
     let bytes = std::fs::read(local).map_err(|e| format!("read {local}: {e}"))?;
     let client = Client::try_default()
         .await
         .map_err(|e| format!("kube client: {e}"))?;
-    let pods: Api<Pod> = Api::default_namespaced(client);
+    let pods: Api<Pod> = Api::namespaced(client, namespace);
     let ap = AttachParams::default()
         .stdin(true)
         .stdout(false)
