@@ -1317,9 +1317,16 @@ fn image_repo(image: &str) -> &str {
 }
 
 /// True if a container image refers to the given docker_build ref.
+///
+/// Both sides are reduced to their repo (tag/digest stripped) before comparing:
+/// Tilt manages its own tags, so a `docker_build("foo:dev")` ref matches a
+/// deployed `foo:dev` (or any other tag of `foo`) by image name. Without
+/// stripping the build ref's tag, a tagged `docker_build` ref would match
+/// nothing, the image would never build, and the workload would fail to pull.
 fn image_matches(image: &str, build_ref: &str) -> bool {
     let img = image_repo(image);
-    img == build_ref || img.ends_with(&format!("/{build_ref}"))
+    let build = image_repo(build_ref);
+    img == build || img.ends_with(&format!("/{build}"))
 }
 
 /// Starlark-facing trigger mode values (match Tilt).
@@ -4800,6 +4807,12 @@ data:
         assert!(image_matches("web:latest", "web"));
         assert!(image_matches("gcr.io/proj/web:abc123", "web"));
         assert!(!image_matches("other:dev", "web"));
+        // A tagged docker_build ref matches by repo (Tilt manages its own tags):
+        // the deployed image's tag need not equal the build ref's tag.
+        assert!(image_matches("app-agent-grpc:dev", "app-agent-grpc:dev"));
+        assert!(image_matches("app-agent-grpc:prod", "app-agent-grpc:dev"));
+        assert!(image_matches("gcr.io/proj/web:abc123", "web:dev"));
+        assert!(!image_matches("other:dev", "web:dev"));
         // Registry host:port must not be mistaken for a tag.
         assert_eq!(image_repo("localhost:5000/web"), "localhost:5000/web");
         assert_eq!(image_repo("web:tag"), "web");

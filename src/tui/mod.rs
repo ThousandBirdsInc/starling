@@ -7,6 +7,8 @@
 //!   j/k, ↑/↓   move selection
 //!   /          filter (Enter apply, Esc clear)
 //!   Enter      detail view for the selected resource (Esc to exit)
+//!   l          full-screen logs for the selected resource
+//!   b          Docker build history (profiled build durations)
 //!   y          copy the visible log window to the clipboard
 //!   t          trigger the selected resource
 //!   Space      pause/resume the selected resource
@@ -158,6 +160,8 @@ enum Mode {
     LogsFilter,
     /// Typing a new preferred backend port for the selected resource.
     PortEdit,
+    /// Full-screen Docker build history (profiled build durations).
+    DockerBuilds,
 }
 
 pub async fn run(proxy_port: u16, tld: &str, tls: bool) {
@@ -218,6 +222,11 @@ struct App {
     status_at: Option<Instant>,
     /// Reference instant for time-based animation (the in-progress spinner).
     start: Instant,
+    /// Docker build history (newest first), loaded when the build-history view
+    /// is opened (and on refresh), from the durable history file.
+    builds: Vec<crate::build_history::DockerBuildRecord>,
+    /// Scroll offset (rows from the top) for the build-history view.
+    builds_scroll: usize,
 }
 
 impl App {
@@ -597,6 +606,8 @@ async fn event_loop(
         status_msg: String::new(),
         status_at: None,
         start: Instant::now(),
+        builds: vec![],
+        builds_scroll: 0,
     };
     let mut last_refresh = Instant::now() - Duration::from_secs(1);
 
@@ -751,6 +762,24 @@ async fn event_loop(
                         KeyCode::Char('y') => app.copy_visible_logs(),
                         _ => {}
                     },
+                    // Full-screen Docker build history.
+                    Mode::DockerBuilds => match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Char('b') | KeyCode::Esc => app.mode = Mode::Normal,
+                        KeyCode::Char('r') => app.builds = crate::build_history::recent(500),
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            let max = app.builds.len().saturating_sub(1);
+                            app.builds_scroll = (app.builds_scroll + 1).min(max);
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            app.builds_scroll = app.builds_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Char('g') | KeyCode::Home => app.builds_scroll = 0,
+                        KeyCode::Char('G') | KeyCode::End => {
+                            app.builds_scroll = app.builds.len().saturating_sub(1);
+                        }
+                        _ => {}
+                    },
                     Mode::Normal | Mode::Detail => match key.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Esc if app.mode == Mode::Detail => app.mode = Mode::Normal,
@@ -773,6 +802,11 @@ async fn event_loop(
                         KeyCode::Char('l') => {
                             app.log_scroll = 0;
                             app.mode = Mode::Logs;
+                        }
+                        KeyCode::Char('b') => {
+                            app.builds = crate::build_history::recent(500);
+                            app.builds_scroll = 0;
+                            app.mode = Mode::DockerBuilds;
                         }
                         KeyCode::Char('/') => {
                             app.mode = Mode::Filter;
@@ -1013,6 +1047,10 @@ fn draw(f: &mut Frame, app: &mut App) {
         draw_logs_fullscreen(f, app);
         return;
     }
+    if app.mode == Mode::DockerBuilds {
+        draw_docker_builds(f, app);
+        return;
+    }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1171,6 +1209,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             ("j/k", "move"),
             ("↵", "detail"),
             ("l", "logs"),
+            ("b", "builds"),
             ("o", "open"),
             ("y", "copy logs"),
             ("t", "trigger"),
@@ -1615,6 +1654,122 @@ fn draw_logs_fullscreen(f: &mut Frame, app: &mut App) {
             ("y", "copy"),
             ("o", "open"),
             ("l/Esc", "back"),
+            ("q", "quit"),
+        ])
+    };
+    f.render_widget(Paragraph::new(footer), chunks[2]);
+}
+
+/// Full-screen Docker build history: each profiled build with its wall-clock
+/// duration, context size, and outcome, newest first.
+fn draw_docker_builds(f: &mut Frame, app: &mut App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // banner
+            Constraint::Min(3),    // table
+            Constraint::Length(1), // footer
+        ])
+        .split(f.area());
+
+    let banner = Line::from(vec![
+        Span::styled(
+            " ✦ Docker builds ",
+            Style::default()
+                .fg(Color::Rgb(20, 22, 34))
+                .bg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {} build(s) · newest first ", app.builds.len()),
+            Style::default().fg(theme::MUTED).bg(theme::HEADER_BG),
+        ),
+    ]);
+    f.render_widget(
+        Paragraph::new(banner).style(Style::default().bg(theme::HEADER_BG)),
+        chunks[0],
+    );
+
+    let header = Row::new(
+        [
+            "WHEN", "PROJECT", "RESOURCE", "IMAGE", "DURATION", "CONTEXT", "RESULT",
+        ]
+        .iter()
+        .map(|h| {
+            Cell::from(*h).style(
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            )
+        }),
+    )
+    .height(1)
+    .bottom_margin(1);
+
+    let inner_h = chunks[1].height.saturating_sub(3) as usize; // borders + header
+    let scroll = app
+        .builds_scroll
+        .min(app.builds.len().saturating_sub(1).max(0));
+    let rows: Vec<Row> = app
+        .builds
+        .iter()
+        .skip(scroll)
+        .take(inner_h.max(1))
+        .map(|b| {
+            let (result, color) = if b.success {
+                ("ok", theme::OK)
+            } else {
+                ("failed", theme::ERR)
+            };
+            Row::new(vec![
+                Cell::from(format_start_time(Some(&b.started_at), true)),
+                Cell::from(Span::styled(
+                    b.project.clone(),
+                    Style::default().fg(theme::MUTED),
+                )),
+                Cell::from(b.resource.clone()),
+                Cell::from(Span::styled(
+                    b.image_ref.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Cell::from(Span::styled(
+                    b.duration_human(),
+                    Style::default().fg(theme::ACCENT),
+                )),
+                Cell::from(b.context_human()),
+                Cell::from(Span::styled(result, Style::default().fg(color))),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Length(12),
+        Constraint::Length(16),
+        Constraint::Length(16),
+        Constraint::Min(20),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(8),
+    ];
+    let table = Table::new(rows, widths).header(header).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme::MUTED)),
+    );
+    f.render_widget(table, chunks[1]);
+
+    let footer: Line = if app.builds.is_empty() {
+        Line::from(vec![Span::styled(
+            " No Docker builds recorded yet. ",
+            Style::default().fg(theme::MUTED),
+        )])
+    } else if let Some(msg) = app.active_status() {
+        status_footer(msg)
+    } else {
+        key_hints(&[
+            ("j/k", "scroll"),
+            ("r", "refresh"),
+            ("b/Esc", "back"),
             ("q", "quit"),
         ])
     };

@@ -1299,7 +1299,42 @@ impl Engine {
                 "INFO",
                 &format!("Building image: {}\n", db.image_ref),
             );
-            match build_image(db, &self.store, &span).await {
+            // Profile the build wall-clock time and append it to the durable
+            // Docker build history (reviewable from the TUI). Recorded on both
+            // success and failure; skipped in dry-run (no real build happens).
+            let started_at = Utc::now();
+            let build_result = build_image(db, &self.store, &span).await;
+            let record = crate::build_history::DockerBuildRecord {
+                image_ref: db.image_ref.clone(),
+                resource: name.to_string(),
+                project: crate::build_history::project_for(&self.config_path),
+                started_at: started_at.to_rfc3339(),
+                duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
+                success: build_result.is_ok(),
+                context_bytes: build_result
+                    .as_ref()
+                    .ok()
+                    .and_then(|r| r.context_bytes)
+                    .unwrap_or(0),
+            };
+            if !self.dry_run {
+                crate::build_history::append(&record);
+            }
+            self.store.append_log(
+                Some(&span),
+                if record.success { "INFO" } else { "ERROR" },
+                &format!(
+                    "docker build {} {} in {}\n",
+                    db.image_ref,
+                    if record.success {
+                        "completed"
+                    } else {
+                        "failed"
+                    },
+                    record.duration_human(),
+                ),
+            );
+            match build_result {
                 Ok(result) => {
                     // Resolve the immutable ref to deploy: a custom_build's reported
                     // output ref, else a content-addressed tag derived from the
@@ -1442,7 +1477,6 @@ impl Engine {
                 m.pod_selector.clone(),
                 m.pod_readiness_ignore,
                 m.live_update.clone(),
-                m.k8s_port_forwards.clone(),
             );
         }
     }
@@ -1591,7 +1625,6 @@ impl Engine {
         selector: std::collections::BTreeMap<String, String>,
         readiness_ignored: bool,
         live_update: Vec<crate::starlingfile::LiveUpdateStep>,
-        port_forwards: Vec<PortForwardSpec>,
     ) {
         let store = self.store.clone();
         let sel = selector
@@ -1601,12 +1634,11 @@ impl Engine {
             .join(",");
         tokio::spawn(async move {
             // Initial-sync is fanned out across every observed pod (each replica
-            // gets the startup sync once). Log streaming is owned by the
-            // controller manager (per-pod follow). Port-forward targets the first
-            // pod, since a local port can bind only one pod.
+            // gets the startup sync once). Log streaming and port-forwarding are
+            // owned by the controller manager (per-pod follow / object-driven
+            // PortForward lifecycle); this watch only maintains the resource's
+            // runtime status and runs initial syncs.
             let mut initial_synced_pods: HashSet<String> = HashSet::new();
-            let mut port_forward_pod: Option<String> = None;
-            let mut port_forward_tasks: Vec<tokio::task::JoinHandle<()>> = vec![];
             loop {
                 let out = Command::new("kubectl")
                     .args(["get", "pods", "-n", &namespace, "-l", &sel, "-o", "json"])
@@ -1652,31 +1684,6 @@ impl Engine {
                             ));
                         }
                     }
-                    // Port-forward: (re)bind to the first pod when it changes.
-                    if !port_forwards.is_empty() {
-                        let pod_name = items
-                            .first()
-                            .and_then(|p| p["metadata"]["name"].as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if !pod_name.is_empty()
-                            && port_forward_pod.as_deref() != Some(pod_name.as_str())
-                        {
-                            for task in port_forward_tasks.drain(..) {
-                                task.abort();
-                            }
-                            port_forward_pod = Some(pod_name.clone());
-                            for spec in port_forwards.clone() {
-                                port_forward_tasks.push(stream_port_forward(
-                                    pod_name.clone(),
-                                    namespace.clone(),
-                                    name.clone(),
-                                    spec,
-                                    store.clone(),
-                                ));
-                            }
-                        }
-                    }
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
@@ -1719,105 +1726,6 @@ async fn kind_load(image_ref: &str, store: &Arc<Store>, span: &str) {
     let _ = run_to_completion(&cmd, store, span).await;
 }
 
-/// Build a docker image via the native Docker API (bollard), streaming build
-/// output to the resource log. Replaces shelling out to `docker build`.
-/// Build the `docker build` argv for a `DockerBuild`, passing through every
-/// option Docker's BuildKit supports (secrets, SSH, cache, platform, network,
-/// build args, extra tags). `dockerfile` overrides `db.dockerfile` (used for
-/// inline `dockerfile_contents` written to a temp file).
-fn docker_build_args(
-    db: &crate::starlingfile::DockerBuild,
-    dockerfile: Option<&std::path::Path>,
-) -> Vec<String> {
-    let mut a = vec!["build".to_string(), "-t".to_string(), db.image_ref.clone()];
-    for t in &db.extra_tags {
-        a.push("-t".to_string());
-        a.push(t.clone());
-    }
-    if let Some(df) = dockerfile
-        .map(|p| p.to_path_buf())
-        .or(db.dockerfile.clone())
-    {
-        a.push("-f".to_string());
-        a.push(df.display().to_string());
-    }
-    if let Some(t) = &db.target {
-        a.push("--target".to_string());
-        a.push(t.clone());
-    }
-    if let Some(p) = &db.platform {
-        a.push("--platform".to_string());
-        a.push(p.clone());
-    }
-    if let Some(n) = &db.network {
-        a.push("--network".to_string());
-        a.push(n.clone());
-    }
-    if db.pull {
-        a.push("--pull".to_string());
-    }
-    for (k, v) in &db.build_args {
-        a.push("--build-arg".to_string());
-        a.push(format!("{k}={v}"));
-    }
-    for c in &db.cache_from {
-        a.push("--cache-from".to_string());
-        a.push(c.clone());
-    }
-    for s in &db.ssh {
-        a.push("--ssh".to_string());
-        a.push(s.clone());
-    }
-    for s in &db.secrets {
-        a.push("--secret".to_string());
-        a.push(s.clone());
-    }
-    for h in &db.extra_hosts {
-        a.push("--add-host".to_string());
-        a.push(h.clone());
-    }
-    a.push(db.context.display().to_string());
-    a
-}
-
-/// Build an image via the `docker build` CLI (BuildKit), for builds needing
-/// secrets/SSH that bollard can't do. Returns Ok(()) on success.
-async fn build_image_buildkit(
-    db: &crate::starlingfile::DockerBuild,
-    store: &Arc<Store>,
-    span: &str,
-) -> Result<(), String> {
-    // Inline dockerfile_contents -> a temp Dockerfile passed via -f.
-    let tmp_df = if let Some(contents) = &db.dockerfile_contents {
-        let p = std::env::temp_dir().join(format!("starling-df-{}", uuid::Uuid::new_v4()));
-        std::fs::write(&p, contents).map_err(|e| format!("writing dockerfile: {e}"))?;
-        Some(p)
-    } else {
-        None
-    };
-    let mut argv = vec!["docker".to_string()];
-    argv.extend(docker_build_args(db, tmp_df.as_deref()));
-    store.append_log(
-        Some(span),
-        "INFO",
-        &format!("docker build (BuildKit): {}\n", db.image_ref),
-    );
-    let cmd = Cmd {
-        argv,
-        workdir: None,
-        env: vec![("DOCKER_BUILDKIT".to_string(), "1".to_string())],
-    };
-    let result = run_to_completion(&cmd, store, span).await;
-    if let Some(p) = tmp_df {
-        let _ = std::fs::remove_file(p);
-    }
-    match result {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(format!("docker build {} failed", db.image_ref)),
-        Err(e) => Err(e),
-    }
-}
-
 /// The outcome of building a single image. `output_ref` is the rewritten ref a
 /// `custom_build` reported via `outputs_image_ref_to` (else None). `digest` is
 /// the locally-resolved immutable image ID (`sha256:...`) when it could be
@@ -1827,6 +1735,9 @@ async fn build_image_buildkit(
 struct BuildResult {
     output_ref: Option<String>,
     digest: Option<String>,
+    /// Build-context size in bytes (the streamed tar), when a Dockerfile build
+    /// produced one. `None` for `custom_build` commands.
+    context_bytes: Option<u64>,
 }
 
 /// Inspect a locally-available image and return its content image ID
@@ -1880,9 +1791,6 @@ async fn build_image(
     store: &Arc<Store>,
     span: &str,
 ) -> Result<BuildResult, String> {
-    use bollard::image::TagImageOptions;
-    use futures::StreamExt;
-
     // custom_build: run the user's command (with EXPECTED_REF) instead of bollard.
     if let Some(command) = &db.command {
         let mut cmd = command.clone();
@@ -1928,77 +1836,171 @@ async fn build_image(
                     Some(d) => Some(d),
                     None => inspect_image_id(inspect_target).await,
                 };
-                Ok(BuildResult { output_ref, digest })
+                Ok(BuildResult {
+                    output_ref,
+                    digest,
+                    context_bytes: None,
+                })
             }
             Ok(false) => Err(format!("custom_build {} command failed", db.image_ref)),
             Err(e) => Err(e),
         };
     }
 
-    // BuildKit-only options (secrets / SSH) can't go through bollard, which has
-    // no BuildKit session. Route those builds through the `docker build` CLI,
-    // which uses BuildKit and supports --secret/--ssh/--cache-from passthrough.
-    if !db.ssh.is_empty() || !db.secrets.is_empty() {
-        build_image_buildkit(db, store, span).await?;
-        let digest = inspect_image_id(&db.image_ref).await;
-        return Ok(BuildResult {
-            output_ref: None,
-            digest,
-        });
-    }
-
-    let docker = bollard::Docker::connect_with_local_defaults()
-        .map_err(|e| format!("connecting to Docker daemon: {e}"))?;
-
-    // Tar the build context (blocking work on a worker thread).
-    let db_for_tar = db.clone();
-    let tar = tokio::task::spawn_blocking(move || build_context_tar(&db_for_tar))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| format!("taring build context {}: {e}", db.context.display()))?;
-
-    let options = build_image_options(db);
-
-    let mut stream = docker.build_image(options, None, Some(tar.into()));
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(info) => {
-                if let Some(s) = info.stream {
-                    for line in s.lines() {
-                        store.append_log(Some(span), "INFO", &format!("{line}\n"));
-                    }
-                }
-                if let Some(err) = info.error {
-                    store.append_log(Some(span), "ERROR", &format!("{err}\n"));
-                    return Err(format!("docker build {}: {err}", db.image_ref));
-                }
-            }
-            Err(e) => return Err(format!("docker build {}: {e}", db.image_ref)),
-        }
-    }
-    for extra_tag in &db.extra_tags {
-        let (repo, tag) = image_ref_repo_and_tag(extra_tag);
-        docker
-            .tag_image(
-                &db.image_ref,
-                Some(TagImageOptions {
-                    repo: repo.clone(),
-                    tag: tag.clone(),
-                }),
-            )
-            .await
-            .map_err(|e| format!("tagging image {} as {extra_tag}: {e}", db.image_ref))?;
-        store.append_log(
-            Some(span),
-            "INFO",
-            &format!("Tagged {} as {extra_tag}\n", db.image_ref),
-        );
-    }
+    // Standard build: stream the `docker build` CLI's output into the resource
+    // log so build progress is visible in Starling. We don't use bollard's
+    // `/build` stream because modern Docker daemons run even that endpoint
+    // through BuildKit, which reports progress via `aux` messages bollard does
+    // not render — leaving the build log silent. The CLI renders BuildKit
+    // progress, and feeding it the filtered context tar on stdin preserves the
+    // `only=` / `ignore` context filtering (which a plain `docker build <dir>`
+    // would lose). extra_tags are applied inline via repeated `-t`.
+    let context_bytes = build_image_streaming(db, store, span).await?;
     let digest = inspect_image_id(&db.image_ref).await;
     Ok(BuildResult {
         output_ref: None,
         digest,
+        context_bytes: Some(context_bytes),
     })
+}
+
+/// Build an image via the `docker build` CLI (BuildKit) with the filtered build
+/// context piped in as a tar on stdin, streaming the builder's output into the
+/// resource's log span. The stdin tar — the same one bollard would have sent —
+/// keeps `only=`/`ignore` filtering intact, and the Dockerfile is referenced by
+/// its path relative to the context root so a Dockerfile in a sub-directory
+/// resolves inside the tar.
+async fn build_image_streaming(
+    db: &crate::starlingfile::DockerBuild,
+    store: &Arc<Store>,
+    span: &str,
+) -> Result<u64, String> {
+    // Tar the (filtered) build context to a temp file off the async runtime.
+    // Streaming to disk (rather than a Vec) bounds memory regardless of context
+    // size, so a large or mis-filtered context can't OOM the engine.
+    store.append_log(
+        Some(span),
+        "INFO",
+        &format!("Preparing build context ({})…\n", db.context.display()),
+    );
+    let tar_path = std::env::temp_dir().join(format!("starling-ctx-{}.tar", uuid::Uuid::new_v4()));
+    let db_for_tar = db.clone();
+    let tar_path_for_tar = tar_path.clone();
+    let bytes = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+        let file = std::fs::File::create(&tar_path_for_tar)?;
+        let mut writer = std::io::BufWriter::new(file);
+        write_build_context_tar(&db_for_tar, &mut writer)?;
+        use std::io::Write;
+        writer.flush()?;
+        Ok(std::fs::metadata(&tar_path_for_tar)?.len())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("taring build context {}: {e}", db.context.display()))?;
+
+    let mut argv = vec!["docker".to_string()];
+    argv.extend(docker_build_stdin_args(db));
+    store.append_log(
+        Some(span),
+        "INFO",
+        &format!(
+            "docker build: {} (context {:.1} MB)\n",
+            db.image_ref,
+            bytes as f64 / (1024.0 * 1024.0)
+        ),
+    );
+    let env = vec![("DOCKER_BUILDKIT".to_string(), "1".to_string())];
+    let stdin = match std::fs::File::open(&tar_path) {
+        Ok(f) => Stdio::from(f),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tar_path);
+            return Err(format!("opening build context tar: {e}"));
+        }
+    };
+    let result = run_streaming_stdin(&argv, stdin, &env, store, span).await;
+    let _ = std::fs::remove_file(&tar_path);
+    match result {
+        Ok(true) => Ok(bytes),
+        Ok(false) => Err(format!("docker build {} failed", db.image_ref)),
+        Err(e) => Err(e),
+    }
+}
+
+/// `docker build` argv for a BuildKit build whose context is read from stdin as
+/// a tar (`-`). The Dockerfile is referenced relative to the context root via
+/// [`dockerfile_rel_to_context`], and every BuildKit option (secrets, SSH,
+/// cache, platform, network, build args, extra tags) is passed through.
+fn docker_build_stdin_args(db: &crate::starlingfile::DockerBuild) -> Vec<String> {
+    let mut a = vec!["build".to_string(), "-t".to_string(), db.image_ref.clone()];
+    for t in &db.extra_tags {
+        a.push("-t".to_string());
+        a.push(t.clone());
+    }
+    a.push("-f".to_string());
+    a.push(dockerfile_rel_to_context(db));
+    if let Some(t) = &db.target {
+        a.push("--target".to_string());
+        a.push(t.clone());
+    }
+    if let Some(p) = &db.platform {
+        a.push("--platform".to_string());
+        a.push(p.clone());
+    }
+    if let Some(n) = &db.network {
+        a.push("--network".to_string());
+        a.push(n.clone());
+    }
+    if db.pull {
+        a.push("--pull".to_string());
+    }
+    for (k, v) in &db.build_args {
+        a.push("--build-arg".to_string());
+        a.push(format!("{k}={v}"));
+    }
+    for c in &db.cache_from {
+        a.push("--cache-from".to_string());
+        a.push(c.clone());
+    }
+    for s in &db.ssh {
+        a.push("--ssh".to_string());
+        a.push(s.clone());
+    }
+    for s in &db.secrets {
+        a.push("--secret".to_string());
+        a.push(s.clone());
+    }
+    for h in &db.extra_hosts {
+        a.push("--add-host".to_string());
+        a.push(h.clone());
+    }
+    a.push("-".to_string()); // context from stdin
+    a
+}
+
+/// The Dockerfile path relative to the build context (the stdin tar's root).
+/// Inline `dockerfile_contents` use the generated name; an on-disk Dockerfile
+/// uses its path relative to the context dir (so a sub-directory Dockerfile
+/// resolves inside the tar), falling back to its file name. Always `/`-separated.
+///
+/// Both paths are canonicalized first so a relative context (e.g. `./..`) and an
+/// absolute/relative Dockerfile under it still strip to the right context-
+/// relative path — a plain `strip_prefix` fails on a relative/absolute mismatch.
+fn dockerfile_rel_to_context(db: &crate::starlingfile::DockerBuild) -> String {
+    if db.dockerfile_contents.is_some() {
+        return GENERATED_DOCKERFILE.to_string();
+    }
+    let Some(df) = &db.dockerfile else {
+        return "Dockerfile".to_string();
+    };
+    let abs_df = std::fs::canonicalize(df).unwrap_or_else(|_| df.clone());
+    let abs_ctx = std::fs::canonicalize(&db.context).unwrap_or_else(|_| db.context.clone());
+    abs_df
+        .strip_prefix(&abs_ctx)
+        .ok()
+        .map(|p| p.display().to_string())
+        .or_else(|| df.file_name().and_then(|n| n.to_str()).map(str::to_string))
+        .unwrap_or_else(|| "Dockerfile".to_string())
+        .replace('\\', "/")
 }
 
 fn custom_build_expected_ref(db: &crate::starlingfile::DockerBuild) -> String {
@@ -2009,33 +2011,6 @@ fn custom_build_expected_ref(db: &crate::starlingfile::DockerBuild) -> String {
         tag.clone()
     } else {
         format!("{}:{tag}", image_ref_repo_and_tag(&db.image_ref).0)
-    }
-}
-
-fn build_image_options(
-    db: &crate::starlingfile::DockerBuild,
-) -> bollard::image::BuildImageOptions<String> {
-    bollard::image::BuildImageOptions {
-        dockerfile: dockerfile_name_for_build(db),
-        t: db.image_ref.clone(),
-        rm: true,
-        forcerm: true,
-        buildargs: db.build_args.iter().cloned().collect(),
-        cachefrom: db.cache_from.clone(),
-        pull: db.pull,
-        networkmode: db.network.clone().unwrap_or_default(),
-        extrahosts: docker_extra_hosts(&db.extra_hosts),
-        target: db.target.clone().unwrap_or_default(),
-        platform: db.platform.clone().unwrap_or_default(),
-        ..Default::default()
-    }
-}
-
-fn docker_extra_hosts(hosts: &[String]) -> Option<String> {
-    match hosts {
-        [] => None,
-        [one] => Some(one.clone()),
-        many => Some(many.join(",")),
     }
 }
 
@@ -2053,41 +2028,49 @@ fn image_ref_repo_and_tag(image_ref: &str) -> (String, String) {
     (image_ref.to_string(), "latest".to_string())
 }
 
-fn build_context_tar(db: &crate::starlingfile::DockerBuild) -> std::io::Result<Vec<u8>> {
+/// Write the (filtered) build-context tar into `writer`. Streaming to an
+/// arbitrary writer keeps memory bounded — a real build streams straight to a
+/// temp file rather than buffering a multi-GB context in a `Vec`.
+fn write_build_context_tar<W: std::io::Write>(
+    db: &crate::starlingfile::DockerBuild,
+    writer: W,
+) -> std::io::Result<()> {
     let mut rules = db.ignore_rules.clone();
     rules.extend(read_dockerignore_rules(&db.context)?);
     let mut only = db.only.clone();
     if !only.is_empty() {
+        // Ensure the Dockerfile survives `only=` filtering. Canonicalize both so a
+        // relative context (`./..`) and the Dockerfile under it strip cleanly.
         let dockerfile = db
             .dockerfile
             .clone()
             .unwrap_or_else(|| db.context.join("Dockerfile"));
-        if let Ok(rel) = dockerfile.strip_prefix(&db.context) {
+        let abs_df = std::fs::canonicalize(&dockerfile).unwrap_or(dockerfile);
+        let abs_ctx = std::fs::canonicalize(&db.context).unwrap_or_else(|_| db.context.clone());
+        if let Ok(rel) = abs_df.strip_prefix(&abs_ctx) {
             only.push(rel.to_path_buf());
         }
     }
-    let mut builder = tar::Builder::new(Vec::new());
+    let mut builder = tar::Builder::new(writer);
     append_context_path(&mut builder, &db.context, &db.context, &rules, &only)?;
     if let Some(contents) = &db.dockerfile_contents {
         append_generated_dockerfile(&mut builder, contents)?;
     }
-    builder.into_inner()
+    builder.into_inner()?;
+    Ok(())
 }
 
-fn dockerfile_name_for_build(db: &crate::starlingfile::DockerBuild) -> String {
-    if db.dockerfile_contents.is_some() {
-        return GENERATED_DOCKERFILE.to_string();
-    }
-    db.dockerfile
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        .unwrap_or("Dockerfile")
-        .to_string()
+/// In-memory build-context tar. Used by tests; production builds stream via
+/// [`write_build_context_tar`] to avoid buffering the whole context.
+#[cfg(test)]
+fn build_context_tar(db: &crate::starlingfile::DockerBuild) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    write_build_context_tar(db, &mut buf)?;
+    Ok(buf)
 }
 
-fn append_generated_dockerfile(
-    builder: &mut tar::Builder<Vec<u8>>,
+fn append_generated_dockerfile<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
     contents: &str,
 ) -> std::io::Result<()> {
     let bytes = contents.as_bytes();
@@ -2121,8 +2104,8 @@ fn read_dockerignore_rules(context: &Path) -> std::io::Result<Vec<IgnoreRule>> {
         .collect())
 }
 
-fn append_context_path(
-    builder: &mut tar::Builder<Vec<u8>>,
+fn append_context_path<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
     root: &Path,
     path: &Path,
     ignore_rules: &[IgnoreRule],
@@ -2229,10 +2212,29 @@ fn spawn_config_watcher(
 /// Apply (or delete) a YAML blob via `kubectl` — the cluster transport the
 /// object reconcilers use. Returns the trimmed stderr on failure.
 async fn kubectl_apply_yaml(yaml: &str, delete: bool) -> Result<(), String> {
+    kubectl_apply_yaml_opts(yaml, delete, false).await
+}
+
+/// Whether a `kubectl apply` error is an immutable-field rejection (so the apply
+/// should be retried with `--force` to delete + recreate). Covers the API
+/// server's "field is immutable" message and the Job-template invalid-value form.
+fn is_immutable_apply_error(err: &str) -> bool {
+    err.contains("field is immutable")
+        || (err.contains("Invalid value") && err.contains("spec.template"))
+}
+
+/// `kubectl apply`/`delete` a YAML blob. With `force`, applies with `--force`,
+/// which deletes and recreates a resource whose live object can't be patched —
+/// needed for immutable objects (e.g. a Job's pod template) whose spec changed.
+async fn kubectl_apply_yaml_opts(yaml: &str, delete: bool, force: bool) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
     let verb = if delete { "delete" } else { "apply" };
+    let mut args = vec![verb, "-f", "-"];
+    if force && !delete {
+        args.push("--force");
+    }
     let mut child = Command::new("kubectl")
-        .args([verb, "-f", "-"])
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -2335,6 +2337,15 @@ pub async fn reconcile_kubernetes_apply(
         crate::kube_client::apply_yaml(&yaml).await
     } else {
         kubectl_apply_yaml(&yaml, false).await
+    };
+    // Immutable objects (a Job's pod template, etc.) reject an in-place update
+    // once their spec changes — e.g. a new image ref. Retry with `--force`, which
+    // deletes and recreates the offending resource (what Tilt does for these).
+    let result = match result {
+        Err(e) if is_immutable_apply_error(&e) && !crate::kube_client::use_kube_rs() => {
+            kubectl_apply_yaml_opts(&yaml, false, true).await
+        }
+        other => other,
     };
     let now = Utc::now().to_rfc3339();
     let error = result.as_ref().err().cloned().unwrap_or_default();
@@ -2674,11 +2685,12 @@ pub async fn reconcile_port_forward(
     }
     let namespace = object_namespace(&obj.object);
     let items = list_pods_for_selector(&selector, &namespace).await?;
-    let pod = items
-        .first()
-        .and_then(|p| p["metadata"]["name"].as_str())
-        .unwrap_or("")
-        .to_string();
+    // Only target a Running pod: `kubectl port-forward` (and the kube-rs
+    // equivalent) errors with "unable to forward port because pod is not
+    // running" against a Pending/ContainerCreating pod, so resolving to one
+    // would produce a stream of failures until it happens to come up. Leaving
+    // podName empty until the pod is Running makes the controller wait instead.
+    let pod = first_running_pod(&items);
     let _ = api.patch(
         "PortForward",
         "default",
@@ -2686,6 +2698,17 @@ pub async fn reconcile_port_forward(
         serde_json::json!({ "status": { "podName": pod, "ready": !pod.is_empty() } }),
     );
     Ok(())
+}
+
+/// The name of the first pod in `Running` phase, or "" if none. Used to gate
+/// port-forwarding on a pod that can actually accept the forward.
+fn first_running_pod(items: &[serde_json::Value]) -> String {
+    items
+        .iter()
+        .find(|p| p["status"]["phase"].as_str() == Some("Running"))
+        .and_then(|p| p["metadata"]["name"].as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Reconcile a `LiveUpdate` object: resolve the target pod for its selector,
@@ -4299,8 +4322,15 @@ fn ignore_pattern_matches(pattern: &str, rel: &str) -> bool {
     }
     let rel = rel.trim_start_matches("./");
     if dir_only {
-        let prefix = format!("{}/", pattern);
-        return rel == pattern || rel.starts_with(&prefix) || path_component_matches(rel, pattern);
+        // The directory itself is what we match; everything beneath an excluded
+        // directory is pruned by the caller not recursing into it. A pattern with
+        // a `/` is a path glob (e.g. `**/target`); a bare name matches the
+        // directory at any depth (e.g. `target` -> any `target` component).
+        return if pattern.contains('/') {
+            glob_match(pattern, rel)
+        } else {
+            rel == pattern || path_component_matches(rel, pattern)
+        };
     }
     if pattern.contains('/') {
         glob_match(pattern, rel)
@@ -4324,7 +4354,15 @@ fn glob_match(pattern: &str, text: &str) -> bool {
                 while chars.peek() == Some(&'*') {
                     chars.next();
                 }
-                regex.push_str(".*");
+                // `**/` matches zero or more leading path segments, so `**/target`
+                // matches `target`, `a/target`, and `a/b/target`. A trailing or
+                // standalone `**` matches anything.
+                if chars.peek() == Some(&'/') {
+                    chars.next();
+                    regex.push_str("(?:.*/)?");
+                } else {
+                    regex.push_str(".*");
+                }
             }
             '*' => regex.push_str("[^/]*"),
             '?' => regex.push_str("[^/]"),
@@ -4458,6 +4496,39 @@ async fn run_with_stdin(
     }
     if let Some(err) = child.stderr.take() {
         stream_lines(err, store.clone(), span.to_string(), "ERROR", None);
+    }
+    let status = child.wait().await.map_err(|e| e.to_string())?;
+    Ok(status.success())
+}
+
+/// Spawn a command with extra env and a caller-provided stdin (e.g. an opened
+/// context-tar file), streaming stdout/stderr into the log span. stderr is
+/// logged at INFO because build tools (BuildKit) write ordinary progress there.
+/// Returns Ok(success).
+async fn run_streaming_stdin(
+    argv: &[String],
+    stdin: Stdio,
+    env: &[(String, String)],
+    store: &Arc<Store>,
+    span: &str,
+) -> Result<bool, String> {
+    let mut command = Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        command.env(k, v);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("spawn {}: {e}", argv.join(" ")))?;
+    if let Some(out) = child.stdout.take() {
+        stream_lines(out, store.clone(), span.to_string(), "INFO", None);
+    }
+    if let Some(err) = child.stderr.take() {
+        stream_lines(err, store.clone(), span.to_string(), "INFO", None);
     }
     let status = child.wait().await.map_err(|e| e.to_string())?;
     Ok(status.success())
@@ -6686,6 +6757,36 @@ spec:
     }
 
     #[test]
+    fn detects_immutable_apply_errors() {
+        assert!(is_immutable_apply_error(
+            "The Job \"db-migrate\" is invalid: spec.template: Invalid value: ...: field is immutable"
+        ));
+        assert!(is_immutable_apply_error(
+            "Deployment.apps \"x\" is invalid: spec.template: Invalid value: core.PodTemplateSpec{...}"
+        ));
+        assert!(!is_immutable_apply_error(
+            "error: unable to recognize \"-\": no matches"
+        ));
+        assert!(!is_immutable_apply_error("connection refused"));
+    }
+
+    #[test]
+    fn first_running_pod_skips_non_running() {
+        let pod = |name: &str, phase: &str| serde_json::json!({"metadata": {"name": name}, "status": {"phase": phase}});
+        // Pending pods are skipped; the first Running pod wins.
+        let items = vec![
+            pod("a", "Pending"),
+            pod("b", "Running"),
+            pod("c", "Running"),
+        ];
+        assert_eq!(first_running_pod(&items), "b");
+        // No Running pod -> empty, so the controller waits instead of forwarding.
+        let items = vec![pod("a", "Pending"), pod("b", "ContainerCreating")];
+        assert_eq!(first_running_pod(&items), "");
+        assert_eq!(first_running_pod(&[]), "");
+    }
+
+    #[test]
     fn content_addressed_ref_derives_immutable_tag_from_digest() {
         assert_eq!(
             immutable_image_tag("sha256:0123456789abcdef0000"),
@@ -6801,7 +6902,7 @@ spec:
     }
 
     #[test]
-    fn docker_build_args_pass_through_buildkit_options() {
+    fn docker_build_stdin_args_pass_through_buildkit_options() {
         let db = crate::starlingfile::DockerBuild {
             ssh: vec!["default".to_string()],
             secrets: vec!["id=sek,src=/tmp/s".to_string()],
@@ -6811,7 +6912,7 @@ spec:
             extra_tags: vec!["example/web:extra".to_string()],
             ..plain_docker_build("example/web")
         };
-        let args = docker_build_args(&db, None);
+        let args = docker_build_stdin_args(&db);
         let joined = args.join(" ");
         assert!(args.starts_with(&[
             "build".to_string(),
@@ -6830,8 +6931,31 @@ spec:
         assert!(joined.contains("--platform linux/amd64"));
         assert!(joined.contains("--build-arg K=v"));
         assert!(joined.contains("-t example/web:extra"));
-        // context is the final arg.
-        assert_eq!(args.last().unwrap(), ".");
+        // The Dockerfile is passed via -f, and the context is read from stdin.
+        assert!(joined.contains("-f "), "dockerfile -f missing: {joined}");
+        assert_eq!(args.last().unwrap(), "-");
+    }
+
+    #[test]
+    fn dockerfile_rel_to_context_resolves_relative_to_context() {
+        // A Dockerfile in a sub-directory of the context resolves to its path
+        // relative to the context root (so it's found inside the stdin tar),
+        // not just its file name.
+        let db = crate::starlingfile::DockerBuild {
+            context: PathBuf::from("/work"),
+            dockerfile: Some(PathBuf::from("/work/server/Dockerfile.devk8s")),
+            ..plain_docker_build("app:dev")
+        };
+        assert_eq!(
+            dockerfile_rel_to_context(&db),
+            "server/Dockerfile.devk8s".to_string()
+        );
+        // Inline contents use the generated name.
+        let inline = crate::starlingfile::DockerBuild {
+            dockerfile_contents: Some("FROM busybox\n".to_string()),
+            ..plain_docker_build("app:dev")
+        };
+        assert_eq!(dockerfile_rel_to_context(&inline), GENERATED_DOCKERFILE);
     }
 
     #[test]
@@ -7429,6 +7553,123 @@ spec:
     }
 
     #[test]
+    fn ignore_pattern_matches_nested_dir_globs() {
+        // `**/target/` must prune `target` dirs at any depth — the case that was
+        // tarring gigabytes of build output. `**` also matches zero segments.
+        assert!(ignore_pattern_matches("**/target/", "target"));
+        assert!(ignore_pattern_matches(
+            "**/target/",
+            "app-agent-builder/target"
+        ));
+        assert!(ignore_pattern_matches("**/target/", "a/b/c/target"));
+        assert!(ignore_pattern_matches(
+            "**/node_modules/",
+            "client/node_modules"
+        ));
+        // A bare directory name matches at any depth.
+        assert!(ignore_pattern_matches("target/", "chidori/target"));
+        // Must not over-match siblings whose name merely starts with the pattern.
+        assert!(!ignore_pattern_matches("**/target/", "app/targetx"));
+        assert!(!ignore_pattern_matches(
+            "**/target/",
+            "app-agent-builder/server"
+        ));
+    }
+
+    #[test]
+    fn build_context_tar_prunes_target_under_only_selected_dir() {
+        // Mirrors the real grpc build: only=['chidori'] selects the dir, and
+        // ignore=['**/target/'] must still prune the (huge) target beneath it.
+        let base =
+            std::env::temp_dir().join(format!("starling-only-target-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(base.join("chidori/target/debug")).unwrap();
+        std::fs::create_dir_all(base.join("chidori/src")).unwrap();
+        std::fs::write(base.join("chidori/src/lib.rs"), "//! lib\n").unwrap();
+        std::fs::write(base.join("chidori/target/debug/big.rlib"), vec![0u8; 4096]).unwrap();
+        std::fs::create_dir_all(base.join("unrelated")).unwrap();
+        std::fs::write(base.join("unrelated/x"), "x\n").unwrap();
+
+        let db = crate::starlingfile::DockerBuild {
+            context: base.clone(),
+            only: vec![PathBuf::from("chidori")],
+            ignore_rules: vec![IgnoreRule {
+                base: base.clone(),
+                pattern: "**/target/".to_string(),
+            }],
+            ..plain_docker_build("example")
+        };
+
+        let tar = build_context_tar(&db).unwrap();
+        let mut archive = tar::Archive::new(std::io::Cursor::new(tar));
+        let paths = archive
+            .entries()
+            .unwrap()
+            .map(|e| {
+                e.unwrap()
+                    .path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            paths.iter().any(|p| p == "chidori/src/lib.rs"),
+            "src kept: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("target")),
+            "target/ under an only= dir should be pruned, got: {paths:?}"
+        );
+        assert!(!paths.iter().any(|p| p.starts_with("unrelated")));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn build_context_tar_prunes_nested_target_dir() {
+        let base =
+            std::env::temp_dir().join(format!("starling-ignore-target-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(base.join("crate/target/debug")).unwrap();
+        std::fs::create_dir_all(base.join("crate/src")).unwrap();
+        std::fs::write(base.join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(base.join("crate/src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(base.join("crate/target/debug/huge.bin"), vec![0u8; 1024]).unwrap();
+
+        let db = crate::starlingfile::DockerBuild {
+            context: base.clone(),
+            // Mirrors a Tiltfile `docker_build(ignore=['**/target/'])`.
+            ignore_rules: vec![IgnoreRule {
+                base: base.clone(),
+                pattern: "**/target/".to_string(),
+            }],
+            ..plain_docker_build("example")
+        };
+
+        let tar = build_context_tar(&db).unwrap();
+        let mut archive = tar::Archive::new(std::io::Cursor::new(tar));
+        let paths = archive
+            .entries()
+            .unwrap()
+            .map(|e| {
+                e.unwrap()
+                    .path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(paths.iter().any(|p| p == "crate/src/main.rs"));
+        assert!(
+            !paths.iter().any(|p| p.contains("target")),
+            "target/ should be pruned, got: {paths:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn dockerfile_contents_are_injected_into_build_context() {
         let base =
             std::env::temp_dir().join(format!("starling-dockerfile-{}", uuid::Uuid::new_v4()));
@@ -7465,7 +7706,7 @@ spec:
             live_update: vec![],
         };
 
-        assert_eq!(dockerfile_name_for_build(&db), GENERATED_DOCKERFILE);
+        assert_eq!(dockerfile_rel_to_context(&db), GENERATED_DOCKERFILE);
         let tar = build_context_tar(&db).unwrap();
         let mut archive = tar::Archive::new(std::io::Cursor::new(tar));
         let mut entries = archive
@@ -7527,18 +7768,19 @@ spec:
             live_update: vec![],
         };
 
-        let options = build_image_options(&db);
-        assert_eq!(options.t, "example:dev");
-        assert_eq!(options.target, "runtime");
-        assert_eq!(options.platform, "linux/amd64");
-        assert_eq!(options.buildargs.get("MODE"), Some(&"dev".to_string()));
-        assert_eq!(options.cachefrom, vec!["example:cache".to_string()]);
-        assert!(options.pull);
-        assert_eq!(options.networkmode, "host");
-        assert_eq!(
-            options.extrahosts,
-            Some("host.docker.internal:host-gateway,db:127.0.0.1".to_string())
-        );
+        let args = docker_build_stdin_args(&db);
+        let joined = args.join(" ");
+        assert!(joined.contains("-t example:dev"));
+        assert!(joined.contains("--target runtime"));
+        assert!(joined.contains("--platform linux/amd64"));
+        assert!(joined.contains("--build-arg MODE=dev"));
+        assert!(joined.contains("--cache-from example:cache"));
+        assert!(joined.contains("--pull"));
+        assert!(joined.contains("--network host"));
+        assert!(joined.contains("-t example:latest"));
+        // Each extra host is its own --add-host flag (BuildKit CLI form).
+        assert!(joined.contains("--add-host host.docker.internal:host-gateway"));
+        assert!(joined.contains("--add-host db:127.0.0.1"));
     }
 
     #[test]

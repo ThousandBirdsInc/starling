@@ -7,6 +7,7 @@
 //! TUI showing every instance's resources.
 
 mod api;
+mod build_history;
 mod certs;
 mod ci;
 mod daemon;
@@ -56,6 +57,10 @@ enum Command {
     Up(UpArgs),
     /// Stop the running instance(s) for the current project.
     Down(DownArgs),
+    /// Stop everything Starling owns — all instances, the processes they spawned
+    /// (port-forwards, log followers, serve commands), and the daemon — and reap
+    /// orphans left by an unclean exit. Returns the machine to a clean slate.
+    Clean,
     /// Print daemon, resource, and named-route status.
     Status(StatusArgs),
     /// Fetch recent logs for one or more resources.
@@ -479,6 +484,12 @@ async fn main() {
         Some(Command::Down(a)) => {
             if let Err(e) = down(a).await {
                 eprintln!("starling down: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Clean) => {
+            if let Err(e) = clean().await {
+                eprintln!("starling clean: {e}");
                 std::process::exit(1);
             }
         }
@@ -1945,6 +1956,208 @@ async fn shutdown_daemon() -> anyhow::Result<()> {
     }
 }
 
+/// Stop everything Starling owns and return the machine to a clean slate.
+///
+/// `daemon --shutdown` relies on the daemon's own bookkeeping, so it can't help
+/// when the daemon is unreachable (a split-brain after an unclean restart) or
+/// when an instance died without reaping the `kubectl port-forward` / `kubectl
+/// logs -f` children it spawned — the usual cause of "address already in use" on
+/// the next `up`. `clean` instead works from the live process table:
+///
+/// 1. Ask the daemon to shut down gracefully (best-effort) so well-behaved
+///    instances tear down their own children.
+/// 2. Sweep the process table: kill every Starling process and the subtree it
+///    owns, plus reparented `kubectl` orphans matching Starling's distinctive
+///    port-forward / log-follow command shapes. Children are signalled first.
+/// 3. Remove the stale socket / pidfile so the next `up` starts fresh.
+///
+/// Safe to run when nothing is up (it simply reports a clean slate).
+async fn clean() -> anyhow::Result<()> {
+    let self_pid = std::process::id();
+
+    // 1. Graceful shutdown first, if a daemon is answering.
+    let client = DaemonClient::new();
+    if client.is_running().await {
+        match request_daemon_shutdown(&client).await {
+            Ok(instances) => {
+                println!(
+                    "Stopping daemon and {} instance{}...",
+                    instances.len(),
+                    if instances.len() == 1 { "" } else { "s" }
+                );
+                wait_for_daemon_stop(&client, &instances).await;
+            }
+            Err(e) => {
+                eprintln!("starling clean: graceful shutdown failed ({e}); sweeping processes");
+            }
+        }
+    }
+
+    // 2. Process sweep: Starling roots + their descendants, plus reparented
+    //    Starling-spawned kubectl orphans.
+    let table = process_table();
+    let roots = starling_root_pids(&table, self_pid);
+    let mut targets = descendants_of(&roots, &table); // children before parents
+    targets.extend(roots.iter().copied());
+    let orphans = orphaned_starling_kubectl(&table);
+    for (pid, cmd) in &orphans {
+        if !targets.contains(pid) {
+            println!("Reaping orphaned process {pid}: {}", short_cmd(cmd));
+            targets.push(*pid);
+        }
+    }
+    targets.retain(|&p| p != self_pid);
+
+    let stopped = kill_pids(&targets).await;
+
+    // 3. Clear stale daemon state so the next `up` starts clean.
+    let _ = std::fs::remove_file(daemon::protocol::socket_path());
+    let _ = std::fs::remove_file(daemon::protocol::pid_path());
+
+    if stopped == 0 {
+        println!("Clean: nothing left running.");
+    } else {
+        println!(
+            "Clean: stopped {stopped} Starling process{}.",
+            if stopped == 1 { "" } else { "es" }
+        );
+    }
+    Ok(())
+}
+
+/// `(pid, ppid, command)` for every process on the host, via `ps`. Returns an
+/// empty table if `ps` is unavailable (the sweep then no-ops).
+fn process_table() -> Vec<(u32, u32, String)> {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,command="])
+        .output()
+    else {
+        return vec![];
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(parse_ps_row)
+        .collect()
+}
+
+/// Parse one `pid ppid command...` row from `ps -axo pid=,ppid=,command=`.
+fn parse_ps_row(line: &str) -> Option<(u32, u32, String)> {
+    let line = line.trim_start();
+    let (pid, rest) = line.split_once(char::is_whitespace)?;
+    let rest = rest.trim_start();
+    let (ppid, cmd) = rest.split_once(char::is_whitespace)?;
+    Some((
+        pid.parse().ok()?,
+        ppid.parse().ok()?,
+        cmd.trim().to_string(),
+    ))
+}
+
+/// PIDs whose executable is the Starling binary (the daemon, its supervisor, and
+/// every `up` instance), excluding `self_pid`. Matched on the program's file
+/// name, so it works however the binary was invoked (`starling`,
+/// `/abs/starling`, `~/.cargo/bin/starling`).
+fn starling_root_pids(table: &[(u32, u32, String)], self_pid: u32) -> Vec<u32> {
+    table
+        .iter()
+        .filter_map(|(pid, _ppid, cmd)| {
+            if *pid == self_pid {
+                return None;
+            }
+            let prog = cmd.split_whitespace().next()?;
+            let base = prog.rsplit('/').next().unwrap_or(prog);
+            (base == "starling").then_some(*pid)
+        })
+        .collect()
+}
+
+/// All descendant PIDs of `roots` (breadth-first, parents before children),
+/// derived from the ppid links in the process table. Excludes the roots.
+fn descendants_of(roots: &[u32], table: &[(u32, u32, String)]) -> Vec<u32> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (pid, ppid, _) in table {
+        children.entry(*ppid).or_default().push(*pid);
+    }
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut out = vec![];
+    let mut queue: VecDeque<u32> = roots.iter().copied().collect();
+    while let Some(p) = queue.pop_front() {
+        if let Some(kids) = children.get(&p) {
+            for &k in kids {
+                if seen.insert(k) {
+                    out.push(k);
+                    queue.push_back(k);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Reparented (`ppid == 1`) `kubectl` processes whose command matches the
+/// distinctive shapes Starling spawns — `kubectl port-forward … --address` and
+/// `kubectl logs … -f --all-containers`. These are the children an instance
+/// leaks when it dies uncleanly; the `--address` / `-f --all-containers` combos
+/// make a false match against a hand-run kubectl unlikely.
+fn orphaned_starling_kubectl(table: &[(u32, u32, String)]) -> Vec<(u32, String)> {
+    table
+        .iter()
+        .filter_map(|(pid, ppid, cmd)| {
+            if *ppid != 1 || !cmd.contains("kubectl") {
+                return None;
+            }
+            let is_port_forward = cmd.contains("port-forward") && cmd.contains("--address");
+            let is_log_follow =
+                cmd.contains("logs") && cmd.contains("-f") && cmd.contains("--all-containers");
+            (is_port_forward || is_log_follow).then(|| (*pid, cmd.clone()))
+        })
+        .collect()
+}
+
+/// SIGTERM every target, wait briefly for graceful exit, then SIGKILL any
+/// survivor. Returns the number that are no longer running afterward.
+async fn kill_pids(pids: &[u32]) -> usize {
+    if pids.is_empty() {
+        return 0;
+    }
+    for &pid in pids {
+        signal_pid(pid, "TERM");
+    }
+    for _ in 0..20 {
+        if pids.iter().all(|&p| !pid_is_running(p)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for &pid in pids {
+        if pid_is_running(pid) {
+            signal_pid(pid, "KILL");
+        }
+    }
+    pids.iter().filter(|&&p| !pid_is_running(p)).count()
+}
+
+/// Send a signal to a pid via `kill`, ignoring errors (the process may already
+/// be gone, or owned by another user).
+fn signal_pid(pid: u32, sig: &str) {
+    let _ = std::process::Command::new("kill")
+        .arg(format!("-{sig}"))
+        .arg(pid.to_string())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Truncate a command line for one-line reporting.
+fn short_cmd(cmd: &str) -> String {
+    const MAX: usize = 80;
+    if cmd.len() <= MAX {
+        cmd.to_string()
+    } else {
+        format!("{}…", &cmd[..MAX])
+    }
+}
+
 async fn restart_daemon(args: &DaemonArgs) -> anyhow::Result<()> {
     let client = DaemonClient::new();
     if client.is_running().await {
@@ -2572,6 +2785,90 @@ async fn up(args: UpArgs) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_identifies_starling_roots_and_subtrees() {
+        // pid, ppid, command — a daemon (200) + supervisor (201), an instance
+        // `up` (300) with kubectl children (310/311), and an unrelated process.
+        let table = vec![
+            (1u32, 0u32, "/sbin/launchd".to_string()),
+            (
+                200,
+                1,
+                "/Users/me/.cargo/bin/starling daemon --proxy-port 1360".to_string(),
+            ),
+            (201, 200, "starling".to_string()),
+            (300, 1, "starling up --no-proxy".to_string()),
+            (
+                310,
+                300,
+                "kubectl port-forward -n agent-builder pod/x 50051:50051 --address 127.0.0.1"
+                    .to_string(),
+            ),
+            (
+                311,
+                300,
+                "kubectl logs -n agent-builder -f --all-containers --tail 20 x".to_string(),
+            ),
+            (999, 1, "kubectl get pods".to_string()),
+        ];
+        // Roots are the three Starling processes; self (300 here is NOT self) is
+        // only excluded when it equals self_pid.
+        let mut roots = starling_root_pids(&table, /*self_pid*/ 0);
+        roots.sort();
+        assert_eq!(roots, vec![200, 201, 300]);
+        // self exclusion drops only the running CLI's own pid.
+        assert!(!starling_root_pids(&table, 200).contains(&200));
+        // Descendants of the instance include both kubectl children.
+        let mut desc = descendants_of(&[300], &table);
+        desc.sort();
+        assert_eq!(desc, vec![310, 311]);
+        // An unrelated `kubectl get pods` is never a root or descendant.
+        assert!(!roots.contains(&999));
+        assert!(!descendants_of(&roots, &table).contains(&999));
+    }
+
+    #[test]
+    fn clean_reaps_only_starling_shaped_kubectl_orphans() {
+        let table = vec![
+            // Reparented Starling port-forward + log-follow orphans (ppid 1).
+            (
+                310u32,
+                1u32,
+                "kubectl port-forward -n ns pod/x 8080:8080 --address 127.0.0.1".to_string(),
+            ),
+            (
+                311,
+                1,
+                "kubectl logs -n ns -f --all-containers --tail 20 x".to_string(),
+            ),
+            // A hand-run kubectl reparented to init must NOT be reaped.
+            (999, 1, "kubectl get pods -A".to_string()),
+            // A Starling-shaped kubectl still owned by a live parent is left to
+            // the subtree sweep, not the orphan pass.
+            (
+                320,
+                300,
+                "kubectl port-forward -n ns pod/y 9090:9090 --address 127.0.0.1".to_string(),
+            ),
+        ];
+        let mut orphans: Vec<u32> = orphaned_starling_kubectl(&table)
+            .into_iter()
+            .map(|(pid, _)| pid)
+            .collect();
+        orphans.sort();
+        assert_eq!(orphans, vec![310, 311]);
+    }
+
+    #[test]
+    fn parses_ps_rows() {
+        assert_eq!(
+            parse_ps_row("  200   1 starling daemon --proxy-port 1360"),
+            Some((200, 1, "starling daemon --proxy-port 1360".to_string()))
+        );
+        // No command column -> skipped.
+        assert_eq!(parse_ps_row("123"), None);
+    }
 
     #[test]
     fn explain_knows_core_kinds() {
