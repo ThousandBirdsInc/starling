@@ -165,36 +165,58 @@ fn collect_images(v: &Value, out: &mut Vec<String>) {
 }
 
 fn extract_match_labels(v: &Value) -> BTreeMap<String, String> {
-    let mut labels = BTreeMap::new();
-    if let Some(Value::Mapping(m)) = v
-        .get("spec")
-        .and_then(|s| s.get("selector"))
-        .and_then(|s| s.get("matchLabels"))
-        .map(|x| x.clone())
-        .as_ref()
-    {
+    // 1. An explicit pod selector (Deployments, StatefulSets, ReplicaSets, …).
+    let selector = labels_at(v, &["spec", "selector", "matchLabels"]);
+    if !selector.is_empty() {
+        return selector;
+    }
+    // 2. The pod template's labels — the labels the pods actually carry. Jobs
+    //    don't set `spec.selector` in their manifest (Kubernetes auto-generates
+    //    a controller-uid selector at apply time), so their `metadata.labels`
+    //    (e.g. Helm chart labels) are NOT what their pods carry. Selecting on the
+    //    pod template labels is what makes a Job's pod logs discoverable.
+    let template = labels_at(v, &["spec", "template", "metadata", "labels"]);
+    if !template.is_empty() {
+        return template;
+    }
+    // CronJobs nest the pod template one level deeper.
+    let cron = labels_at(
+        v,
+        &[
+            "spec",
+            "jobTemplate",
+            "spec",
+            "template",
+            "metadata",
+            "labels",
+        ],
+    );
+    if !cron.is_empty() {
+        return cron;
+    }
+    // 3. Bare Pods: their own labels are the selector.
+    labels_at(v, &["metadata", "labels"])
+}
+
+/// Collect a `string: string` label map at a mapping path. Empty if any path
+/// segment is absent or the leaf isn't a string→string mapping.
+fn labels_at(v: &Value, path: &[&str]) -> BTreeMap<String, String> {
+    let mut cur = v;
+    for key in path {
+        match cur.get(*key) {
+            Some(next) => cur = next,
+            None => return BTreeMap::new(),
+        }
+    }
+    let mut out = BTreeMap::new();
+    if let Value::Mapping(m) = cur {
         for (k, val) in m {
             if let (Some(k), Some(val)) = (k.as_str(), val.as_str()) {
-                labels.insert(k.to_string(), val.to_string());
+                out.insert(k.to_string(), val.to_string());
             }
         }
     }
-    // Bare Pods: use their own labels as the selector.
-    if labels.is_empty() {
-        if let Some(Value::Mapping(m)) = v
-            .get("metadata")
-            .and_then(|md| md.get("labels"))
-            .map(|x| x.clone())
-            .as_ref()
-        {
-            for (k, val) in m {
-                if let (Some(k), Some(val)) = (k.as_str(), val.as_str()) {
-                    labels.insert(k.to_string(), val.to_string());
-                }
-            }
-        }
-    }
-    labels
+    out
 }
 
 #[cfg(test)]
@@ -259,5 +281,40 @@ spec:
     fn skips_non_resource_docs() {
         let entities = parse_yaml("---\nfoo: bar\n---\n# just a comment\n");
         assert!(entities.is_empty());
+    }
+
+    #[test]
+    fn job_selector_uses_pod_template_labels_not_metadata() {
+        // A Job sets no spec.selector (k8s auto-generates it); its own
+        // metadata.labels (e.g. Helm chart labels) are NOT what its pods carry.
+        // The selector must come from the pod template labels.
+        let yaml = r#"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: app-agent-0.1.0
+spec:
+  template:
+    metadata:
+      labels:
+        app: db-migrate
+    spec:
+      containers:
+      - name: migrate
+        image: app-agent-grpc:dev
+"#;
+        let entities = parse_yaml(yaml);
+        let job = &entities[0];
+        assert_eq!(job.kind, "Job");
+        assert!(job.is_workload());
+        // The selector is the pod template label, not the Helm chart labels.
+        assert_eq!(
+            job.match_labels.get("app").map(String::as_str),
+            Some("db-migrate")
+        );
+        assert!(!job.match_labels.contains_key("helm.sh/chart"));
     }
 }

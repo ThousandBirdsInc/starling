@@ -3071,10 +3071,14 @@ fn stream_pod_logs(
     span: String,
     store: Arc<Store>,
 ) -> tokio::task::JoinHandle<()> {
+    // Seed enough scrollback that a short-lived pod (e.g. a Job that has already
+    // run to completion by the time we attach) shows its whole execution log,
+    // not just the last couple of lines.
+    const TAIL: i64 = 500;
     // Typed `Api::log_stream` follow under kube-rs, else `kubectl logs -f`.
     if crate::kube_client::use_kube_rs() {
         return tokio::spawn(async move {
-            match crate::kube_client::log_stream(&pod, &namespace, 20).await {
+            match crate::kube_client::log_stream(&pod, &namespace, TAIL).await {
                 Ok(reader) => stream_lines(reader, store, span, "INFO", None),
                 Err(e) => store.append_log(Some(&span), "ERROR", &format!("log stream: {e}\n")),
             }
@@ -3089,7 +3093,7 @@ fn stream_pod_logs(
                 "-f",
                 "--all-containers",
                 "--tail",
-                "20",
+                &TAIL.to_string(),
                 &pod,
             ])
             .kill_on_drop(true)
