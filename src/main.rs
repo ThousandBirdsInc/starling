@@ -1214,7 +1214,10 @@ async fn ci(args: CiArgs) -> ! {
         api_objects,
         max_parallel_updates,
     );
-    tokio::spawn(eng.run());
+    // CI never signals an explicit shutdown; hold the sender so the engine's
+    // shutdown receiver pends forever and the run loop is driven by builds only.
+    let (_ci_shutdown_tx, ci_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(eng.run(ci_shutdown_rx));
 
     println!("starling ci: bringing up {} ...", config_path.display());
     let mut elapsed_ms = 0u64;
@@ -1540,7 +1543,10 @@ async fn down(args: DownArgs) -> anyhow::Result<()> {
         if ids.len() == 1 { "" } else { "s" }
     );
 
-    for _ in 0..50 {
+    // The instance bounds its own teardown (stop local serves, then run k8s
+    // delete commands) at ~10s before exiting, so wait a bit past that for the
+    // pid to clear rather than bailing while teardown is still in flight.
+    for _ in 0..150 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if instances.iter().all(|i| !pid_is_running(i.pid)) {
             println!("Stopped.");
@@ -1562,7 +1568,8 @@ async fn down(args: DownArgs) -> anyhow::Result<()> {
     }
 
     anyhow::bail!(
-        "shutdown was queued, but {} instance{} did not stop within 5s",
+        "shutdown was queued, but {} instance{} did not stop within 15s; \
+         run `starling clean` to force-kill leftover processes",
         ids.len(),
         if ids.len() == 1 { "" } else { "s" }
     )
@@ -2562,6 +2569,13 @@ async fn up(args: UpArgs) {
     // before the manifests move into the engine).
     let mut k8s_down_specs = Vec::new();
 
+    // Handle + shutdown signal for the engine task. On `starling down` / Ctrl-C
+    // we signal the engine to stop all local serves (killing their process
+    // groups) and wait for it to finish before the instance exits, so services
+    // don't leak.
+    let mut engine_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut engine_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>> = None;
+
     // API object store, shared between the engine (which populates it) and the
     // web server (which exposes read/watch routes over it).
     let api_objects = Arc::new(api::store::ApiObjectStore::new());
@@ -2616,7 +2630,9 @@ async fn up(args: UpArgs) {
                 result.max_parallel_updates,
             );
             store.set_scrub_secrets(result.secret_values.clone());
-            tokio::spawn(eng.run());
+            let (eng_shutdown_tx, eng_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            engine_shutdown_tx = Some(eng_shutdown_tx);
+            engine_handle = Some(tokio::spawn(eng.run(eng_shutdown_rx)));
             store.apply_session_settings(result.team_id, &result.feature_flags);
             for (name, path) in &result.extension_repos {
                 api_objects.apply(
@@ -2776,11 +2792,29 @@ async fn up(args: UpArgs) {
     println!("starling up running — open the dashboard with `starling`. Ctrl-C to stop.");
 
     // A daemon-queued Shutdown (from `starling down` / `daemon --shutdown`) tears
-    // down deployed resources; Ctrl-C leaves them running, matching Tilt.
+    // down deployed k8s resources; Ctrl-C leaves those running, matching Tilt.
+    // Either way the local serves below are stopped — they're children of this
+    // instance and must not outlive it.
     let down_requested = tokio::select! {
         _ = tokio::signal::ctrl_c() => false,
         _ = shutdown_rx.recv() => true,
     };
+    // Stop local serves first so each one's whole process group is killed (not
+    // orphaned) before the instance exits — applies to both `starling down` and
+    // Ctrl-C. Bounded by a timeout so a serve stuck ignoring SIGTERM/SIGKILL
+    // can't hang shutdown indefinitely (the engine SIGKILLs after a per-serve
+    // grace, so this should only ever bite if the engine itself is wedged).
+    if let Some(tx) = engine_shutdown_tx.take() {
+        let _ = tx.send(());
+    }
+    if let Some(handle) = engine_handle.take() {
+        if tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .is_err()
+        {
+            eprintln!("starling: local services did not stop within 10s");
+        }
+    }
     if down_requested && !k8s_down_specs.is_empty() {
         println!("Running k8s_custom_deploy delete commands...");
         engine::run_k8s_down(&k8s_down_specs, &store, args.dry_run).await;

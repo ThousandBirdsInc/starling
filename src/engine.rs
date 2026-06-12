@@ -411,8 +411,14 @@ impl Engine {
         }
     }
 
-    /// Run the engine until the build channel closes.
-    pub async fn run(mut self) {
+    /// Run the engine until the build channel closes or a shutdown is signalled.
+    ///
+    /// `shutdown_rx` fires on `starling down` / Ctrl-C; the engine then stops
+    /// every running `serve_cmd` (killing each one's process group) before the
+    /// task ends, so local services don't leak after the instance exits. For
+    /// callers that never shut down explicitly (e.g. `starling ci`), hold the
+    /// paired sender open so the receiver simply pends forever.
+    pub async fn run(mut self, mut shutdown_rx: tokio::sync::oneshot::Receiver<()>) {
         self.reconcile_named_ports().await;
         self.refresh_declared_services();
         self.materialize_all();
@@ -444,6 +450,12 @@ impl Engine {
         // Service build requests (triggers + file changes) and reloads.
         loop {
             tokio::select! {
+                // `starling down` / Ctrl-C: tear down local serves (process
+                // groups), then leave the loop so the task ends cleanly.
+                _ = &mut shutdown_rx => {
+                    self.stop_all_serves().await;
+                    break;
+                }
                 maybe = self.build_rx.recv() => {
                     let Some(first_request) = maybe else { break };
                     // Coalesce a burst of requests.
@@ -1080,6 +1092,46 @@ impl Engine {
         }
         self.service_registry.lock().unwrap().remove(name);
         self.refresh_declared_services();
+    }
+
+    /// Stop every running `serve_cmd`, killing each one's entire process group
+    /// (SIGTERM, then SIGKILL after a grace period — see
+    /// [`terminate_process_group_by_pid`]). The terminations run concurrently so
+    /// total teardown time is bounded by the grace period rather than the number
+    /// of services. Invoked on `starling down` / Ctrl-C: without it the serve
+    /// children — each spawned into its own process group — would be orphaned
+    /// when the instance process exits instead of killed.
+    async fn stop_all_serves(&mut self) {
+        let tasks: Vec<(String, ServeTask)> = self.serve_tasks.drain().collect();
+        self.started_serves.clear();
+        if tasks.is_empty() {
+            return;
+        }
+        self.store.append_log(
+            None,
+            "INFO",
+            &format!(
+                "Stopping {} local service{}...\n",
+                tasks.len(),
+                if tasks.len() == 1 { "" } else { "s" }
+            ),
+        );
+        let mut handles = Vec::with_capacity(tasks.len());
+        for (name, task) in tasks {
+            let proxy = self.proxy.clone();
+            let registry = self.service_registry.clone();
+            handles.push(tokio::spawn(async move {
+                terminate_process_group(task.pid).await;
+                task.abort.abort();
+                if let Some(proxy) = proxy {
+                    proxy.remove(&name).await;
+                }
+                registry.lock().unwrap().remove(&name);
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
     }
 
     async fn replace_serve_after_update(&mut self, name: &str, m: Manifest) {
