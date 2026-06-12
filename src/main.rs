@@ -2687,12 +2687,20 @@ async fn up(args: UpArgs) {
         let api_objects = api_objects.clone();
         let api_addr = api_addr.clone();
         tokio::spawn(async move {
+            let mut changes = store.subscribe();
             let mut tick = tokio::time::interval(Duration::from_millis(1000));
             // Segment count already pushed to the daemon; only newer lines go
             // out each tick so the daemon appends rather than re-sending tails.
             let mut log_checkpoint = 0usize;
             loop {
-                tick.tick().await;
+                let woke_for_change = tokio::select! {
+                    _ = tick.tick() => false,
+                    _ = changes.recv() => true,
+                };
+                if woke_for_change {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    while changes.try_recv().is_ok() {}
+                }
                 let view = store.full_view();
                 let resources: Vec<ResourceSnapshot> =
                     view.ui_resources.iter().map(snapshot).collect();

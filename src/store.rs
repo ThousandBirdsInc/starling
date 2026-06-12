@@ -332,12 +332,41 @@ impl Store {
     pub fn update_status(&self, name: &str, f: impl FnOnce(&mut UIResourceStatus)) {
         {
             let mut inner = self.inner.lock().unwrap();
-            if let Some(r) = inner
+            let Some(index) = inner
                 .resources
-                .iter_mut()
-                .find(|r| r.metadata.as_ref().map(|m| m.name.as_str()) == Some(name))
+                .iter()
+                .position(|r| r.metadata.as_ref().map(|m| m.name.as_str()) == Some(name))
+            else {
+                return;
+            };
+
+            let mut status_changes = Vec::new();
             {
-                f(r.status.get_or_insert_with(Default::default));
+                let status = inner.resources[index]
+                    .status
+                    .get_or_insert_with(Default::default);
+                let old_update = status.update_status.clone();
+                let old_runtime = status.runtime_status.clone();
+                f(status);
+
+                if old_update != status.update_status {
+                    status_changes.push(("update", old_update, status.update_status.clone()));
+                }
+                if old_runtime != status.runtime_status {
+                    status_changes.push(("runtime", old_runtime, status.runtime_status.clone()));
+                }
+            }
+
+            if !status_changes.is_empty() {
+                let now = Utc::now().to_rfc3339();
+                for (kind, old, new) in status_changes {
+                    let text = format!(
+                        "Status change {now}: {kind} {} -> {}\n",
+                        status_log_value(kind, old.as_deref()),
+                        status_log_value(kind, new.as_deref())
+                    );
+                    Self::append_log_locked(&mut inner, Some(name), "INFO", &text);
+                }
             }
         }
         self.notify();
@@ -599,6 +628,15 @@ fn base_resource(span: &str) -> &str {
     span.split(':').next().unwrap_or(span)
 }
 
+fn status_log_value(kind: &str, value: Option<&str>) -> String {
+    match value.unwrap_or_default() {
+        "" | "none" | "not_applicable" => "none".to_string(),
+        "in_progress" if kind == "runtime" => "restarting".to_string(),
+        "in_progress" if kind == "update" => "building".to_string(),
+        other => other.replace('_', " "),
+    }
+}
+
 /// Severity ordering for level filtering. Unknown levels sort as `INFO`.
 fn log_level_rank(level: &str) -> u8 {
     match level.to_ascii_uppercase().as_str() {
@@ -674,6 +712,51 @@ mod tests {
         });
         assert_eq!(web_err.len(), 1);
         assert_eq!(web_err[0].text.trim(), "boom");
+    }
+
+    #[test]
+    fn status_changes_are_logged_with_timestamps() {
+        let store = test_store();
+        store.upsert_resource(UIResource {
+            metadata: Some(ObjectMeta {
+                name: "web".to_string(),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(UIResourceStatus {
+                update_status: Some("pending".to_string()),
+                runtime_status: Some("pending".to_string()),
+                ..Default::default()
+            }),
+        });
+
+        store.update_status("web", |st| {
+            st.update_status = Some("in_progress".to_string());
+            st.runtime_status = Some("in_progress".to_string());
+        });
+
+        let logs = store.query_logs(&LogQuery {
+            span: Some("web".to_string()),
+            ..Default::default()
+        });
+        let changes: Vec<_> = logs
+            .iter()
+            .filter(|line| line.text.starts_with("Status change "))
+            .collect();
+        assert_eq!(changes.len(), 2);
+
+        for line in &changes {
+            let text = line.text.trim();
+            let rest = text.strip_prefix("Status change ").unwrap();
+            let (timestamp, _) = rest.split_once(": ").unwrap();
+            chrono::DateTime::parse_from_rfc3339(timestamp).unwrap();
+        }
+        assert!(changes
+            .iter()
+            .any(|line| line.text.contains("update pending -> building")));
+        assert!(changes
+            .iter()
+            .any(|line| line.text.contains("runtime pending -> restarting")));
     }
 
     #[test]
