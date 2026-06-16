@@ -989,6 +989,31 @@ fn format_start_time(timestamp: Option<&str>, full: bool) -> String {
     }
 }
 
+/// Compact "age" of a resource: elapsed time since it last started, rendered
+/// like k9s (`10s`, `3m`, `2h`, `5d`). Empty when the start time is missing or
+/// unparseable, and clamped at zero so clock skew never shows a negative age.
+fn format_age(timestamp: Option<&str>) -> String {
+    let Some(timestamp) = timestamp else {
+        return String::new();
+    };
+    let Ok(parsed) = DateTime::parse_from_rfc3339(timestamp) else {
+        return String::new();
+    };
+    let secs = Local::now()
+        .signed_duration_since(parsed)
+        .num_seconds()
+        .max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
 fn parse_port(input: &str) -> Option<u16> {
     let port = input.parse::<u16>().ok()?;
     (port != 0).then_some(port)
@@ -1075,6 +1100,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             "RUNTIME",
             "RESTARTS",
             "LAST START",
+            "AGE",
             "PORT",
             "POD",
             "URL",
@@ -1113,6 +1139,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                         .unwrap_or_default(),
                 ),
                 Cell::from(format_start_time(r.last_start.as_deref(), false)),
+                Cell::from(format_age(r.last_start.as_deref())),
                 Cell::from(r.route_port.map(|p| p.to_string()).unwrap_or_default()),
                 Cell::from(r.pod.clone()),
                 Cell::from(Span::styled(r.url.clone(), Style::default().fg(theme::URL))),
@@ -1128,6 +1155,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Length(13),
         Constraint::Length(8),
         Constraint::Length(10),
+        Constraint::Length(5),
         Constraint::Length(7),
         Constraint::Length(16),
         Constraint::Min(18),
@@ -1440,11 +1468,26 @@ fn bold() -> Style {
 #[cfg(test)]
 mod tests {
     use super::{
-        ansi_log_line, clamp_scroll, filter_log_lines, hostname_from_url, parse_port,
+        ansi_log_line, clamp_scroll, filter_log_lines, format_age, hostname_from_url, parse_port,
         plain_log_text, pretty_status, route_port_for_url, visible_window, StatusKind,
     };
     use crate::daemon::protocol::{DashboardState, RouteInfo};
+    use chrono::{Duration, Local};
     use ratatui::style::{Color, Modifier};
+
+    #[test]
+    fn format_age_renders_compact_units_and_clamps() {
+        let ago = |d: Duration| (Local::now() - d).to_rfc3339();
+        assert_eq!(format_age(Some(&ago(Duration::seconds(5)))), "5s");
+        assert_eq!(format_age(Some(&ago(Duration::minutes(3)))), "3m");
+        assert_eq!(format_age(Some(&ago(Duration::hours(2)))), "2h");
+        assert_eq!(format_age(Some(&ago(Duration::days(5)))), "5d");
+        // Missing or unparseable timestamps render as empty, not an error.
+        assert_eq!(format_age(None), "");
+        assert_eq!(format_age(Some("not-a-time")), "");
+        // Clock skew (a future start time) clamps to zero rather than going negative.
+        assert_eq!(format_age(Some(&ago(Duration::seconds(-30)))), "0s");
+    }
 
     #[test]
     fn plain_log_text_strips_controls_but_keeps_visible_text() {
