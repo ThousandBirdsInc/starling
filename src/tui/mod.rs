@@ -12,7 +12,8 @@
 //!   y          copy the visible log window to the clipboard
 //!   t          trigger the selected resource
 //!   Space      pause/resume the selected resource
-//!   R          restart the selected resource's serve_cmd
+//!   R          restart the selected resource (serve_cmd, or for a k8s
+//!              resource: rebuild on a changed Dockerfile, else roll its pods)
 //!   p          change the selected resource's preferred backend port
 //!   PgUp/PgDn  page through logs (G/End follow tail, g/Home jump to oldest)
 //!   r          refresh now

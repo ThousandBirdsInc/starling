@@ -83,6 +83,11 @@ pub struct Engine {
     /// Caps concurrent parallel local-resource updates
     /// (`update_settings(max_parallel_updates=...)`).
     parallel_sem: Arc<tokio::sync::Semaphore>,
+    /// Dockerfile content captured at each image's last successful build, keyed
+    /// by `image_ref`. Lets a dashboard restart (`R`) of a Kubernetes resource
+    /// detect an edited Dockerfile and rebuild instead of merely rolling pods.
+    /// Behind a mutex because builds run from `&self` methods.
+    built_dockerfiles: Arc<Mutex<HashMap<String, String>>>,
 }
 
 struct ServeTask {
@@ -151,6 +156,7 @@ impl Engine {
             parallel_sem: Arc::new(tokio::sync::Semaphore::new(
                 max_parallel_updates.unwrap_or(usize::MAX >> 4),
             )),
+            built_dockerfiles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1029,9 +1035,18 @@ impl Engine {
         );
     }
 
-    /// Restart a resource's serve_cmd: kill the running process and start it
-    /// again (gets a fresh port + route).
+    /// Restart a resource. For a local resource this kills and respawns its
+    /// serve_cmd (fresh port + route). For a Kubernetes resource it rebuilds the
+    /// image when its Dockerfile changed, otherwise rolls the workload's pods —
+    /// see [`Engine::restart_k8s`].
     async fn restart(&mut self, name: &str) {
+        if let Some(&i) = self.by_name.get(name) {
+            if self.manifests[i].kind == TargetKind::Kubernetes {
+                let m = self.manifests[i].clone();
+                self.restart_k8s(name, &m).await;
+                return;
+            }
+        }
         // Reflect the restart immediately. stop_serve aborts the running task
         // without touching runtime_status, and spawn_serve only sets "pending"
         // after async port/route setup — so without this the dashboard keeps
@@ -1046,6 +1061,125 @@ impl Engine {
             if !m.serve_cmd.is_empty() {
                 self.started_serves.insert(name.to_string());
                 self.spawn_serve(m);
+            }
+        }
+    }
+
+    /// Restart a Kubernetes resource. If any of its Dockerfiles have been edited
+    /// since the last build, do a full rebuild + redeploy (so the change is
+    /// actually deployed); otherwise roll the workload's pods so the running
+    /// service reboots without an unnecessary rebuild.
+    async fn restart_k8s(&mut self, name: &str, m: &Manifest) {
+        if self.dockerfile_changed(m) {
+            self.store.append_log(
+                Some(name),
+                "INFO",
+                "Dockerfile changed; rebuilding and redeploying...\n",
+            );
+            self.run_k8s_build(name, m, true, None).await;
+            return;
+        }
+        self.rollout_restart_k8s(name, m).await;
+    }
+
+    /// Whether any of the resource's `docker_build` Dockerfiles differ from the
+    /// version captured at its last successful build. An image we have no record
+    /// of building this session counts as changed, so the first restart after a
+    /// manual-only resource is built still picks up edits. `custom_build`s and
+    /// builds with no readable Dockerfile have nothing to compare and are
+    /// ignored (they fall through to a pod roll).
+    fn dockerfile_changed(&self, m: &Manifest) -> bool {
+        let baseline = self.built_dockerfiles.lock().unwrap();
+        m.docker_builds.iter().any(|db| match dockerfile_fingerprint(db) {
+            Some(current) => baseline.get(&db.image_ref) != Some(&current),
+            None => false,
+        })
+    }
+
+    /// Roll a Kubernetes workload's pods without rebuilding: `kubectl rollout
+    /// restart` for the workload kinds that support it, falling back to deleting
+    /// the resource's pods by selector for everything else (bare Pods, Jobs).
+    async fn rollout_restart_k8s(&self, name: &str, m: &Manifest) {
+        if self.dry_run {
+            self.store.append_log(
+                Some(name),
+                "INFO",
+                "Restart skipped (dry-run): would roll the workload's pods\n",
+            );
+            return;
+        }
+        // Optimistic feedback; the persistent pod watch reconciles the real
+        // status as the new pods come up.
+        self.store.update_status(name, |st| {
+            st.runtime_status = Some("in_progress".to_string());
+        });
+
+        let kind = m
+            .k8s_workload
+            .as_deref()
+            .and_then(|w| w.split('/').next())
+            .map(str::to_ascii_lowercase);
+        let rollable = matches!(
+            kind.as_deref(),
+            Some("deployment" | "statefulset" | "daemonset" | "replicaset")
+        );
+
+        let argv = if let (true, Some(workload)) = (rollable, m.k8s_workload.as_deref()) {
+            self.store.append_log(
+                Some(name),
+                "INFO",
+                &format!("Restarting workload (kubectl rollout restart {workload})...\n"),
+            );
+            vec![
+                "kubectl".to_string(),
+                "rollout".to_string(),
+                "restart".to_string(),
+                workload.to_string(),
+                "-n".to_string(),
+                m.namespace.clone(),
+            ]
+        } else if !m.pod_selector.is_empty() {
+            let selector = m
+                .pod_selector
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            self.store.append_log(
+                Some(name),
+                "INFO",
+                &format!("Restarting pods (kubectl delete pod -l {selector})...\n"),
+            );
+            vec![
+                "kubectl".to_string(),
+                "delete".to_string(),
+                "pod".to_string(),
+                "-l".to_string(),
+                selector,
+                "-n".to_string(),
+                m.namespace.clone(),
+            ]
+        } else {
+            self.store.update_status(name, |st| {
+                st.runtime_status = Some("none".to_string());
+            });
+            self.store.append_log(
+                Some(name),
+                "WARN",
+                "Nothing to restart: resource has no workload or pod selector\n",
+            );
+            return;
+        };
+
+        match run_with_stdin(&argv, "", &self.store, name).await {
+            Ok(true) => {}
+            Ok(false) => {
+                self.store
+                    .append_log(Some(name), "ERROR", "Restart failed\n");
+            }
+            Err(e) => {
+                self.store
+                    .append_log(Some(name), "ERROR", &format!("Restart failed: {e}\n"));
             }
         }
     }
@@ -1388,6 +1522,15 @@ impl Engine {
             );
             match build_result {
                 Ok(result) => {
+                    // Capture the Dockerfile this image was just built from, so a
+                    // later dashboard restart can tell whether it has been edited
+                    // and needs a rebuild rather than a plain pod roll.
+                    if let Some(fp) = dockerfile_fingerprint(db) {
+                        self.built_dockerfiles
+                            .lock()
+                            .unwrap()
+                            .insert(db.image_ref.clone(), fp);
+                    }
                     // Resolve the immutable ref to deploy: a custom_build's reported
                     // output ref, else a content-addressed tag derived from the
                     // build digest, else the declared ref (no digest available).
@@ -1798,6 +1941,18 @@ struct BuildResult {
 async fn inspect_image_id(image_ref: &str) -> Option<String> {
     let docker = bollard::Docker::connect_with_local_defaults().ok()?;
     docker.inspect_image(image_ref).await.ok()?.id
+}
+
+/// The Dockerfile content backing a `docker_build`, used to detect edits
+/// between builds: the inline `dockerfile_contents` when present, else the
+/// on-disk Dockerfile read from its (absolute) path. `None` for a `custom_build`
+/// or when the file can't be read — there's nothing to compare.
+fn dockerfile_fingerprint(db: &crate::starlingfile::DockerBuild) -> Option<String> {
+    if let Some(contents) = &db.dockerfile_contents {
+        return Some(contents.clone());
+    }
+    let path = db.dockerfile.as_ref()?;
+    std::fs::read_to_string(path).ok()
 }
 
 /// Extract a `@sha256:...` digest already embedded in an image ref, if present
@@ -6860,6 +7015,42 @@ spec:
             Some("sha256:abc".to_string())
         );
         assert_eq!(digest_from_ref("web:tag"), None);
+    }
+
+    #[test]
+    fn dockerfile_fingerprint_reads_inline_and_on_disk() {
+        // Inline dockerfile_contents are used verbatim.
+        let mut inline = plain_docker_build("example/web");
+        inline.dockerfile_contents = Some("FROM busybox\n".to_string());
+        assert_eq!(
+            dockerfile_fingerprint(&inline),
+            Some("FROM busybox\n".to_string())
+        );
+
+        // An on-disk Dockerfile is read from its path, and edits change the
+        // fingerprint (the signal a restart uses to decide on a rebuild).
+        let path = std::env::temp_dir()
+            .join(format!("starling-df-fp-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "FROM alpine\n").unwrap();
+        let mut on_disk = plain_docker_build("example/web");
+        on_disk.dockerfile = Some(path.clone());
+        assert_eq!(
+            dockerfile_fingerprint(&on_disk),
+            Some("FROM alpine\n".to_string())
+        );
+        std::fs::write(&path, "FROM alpine:3.20\n").unwrap();
+        assert_eq!(
+            dockerfile_fingerprint(&on_disk),
+            Some("FROM alpine:3.20\n".to_string())
+        );
+        std::fs::remove_file(&path).ok();
+
+        // A custom_build / plain build with no Dockerfile has nothing to compare.
+        assert_eq!(dockerfile_fingerprint(&plain_docker_build("example/web")), None);
+        // A missing on-disk path degrades to None rather than panicking.
+        let mut missing = plain_docker_build("example/web");
+        missing.dockerfile = Some(std::path::PathBuf::from("/nope/Dockerfile.absent"));
+        assert_eq!(dockerfile_fingerprint(&missing), None);
     }
 
     #[test]
