@@ -1090,10 +1090,12 @@ impl Engine {
     /// ignored (they fall through to a pod roll).
     fn dockerfile_changed(&self, m: &Manifest) -> bool {
         let baseline = self.built_dockerfiles.lock().unwrap();
-        m.docker_builds.iter().any(|db| match dockerfile_fingerprint(db) {
-            Some(current) => baseline.get(&db.image_ref) != Some(&current),
-            None => false,
-        })
+        m.docker_builds
+            .iter()
+            .any(|db| match dockerfile_fingerprint(db) {
+                Some(current) => baseline.get(&db.image_ref) != Some(&current),
+                None => false,
+            })
     }
 
     /// Roll a Kubernetes workload's pods without rebuilding: `kubectl rollout
@@ -7029,8 +7031,7 @@ spec:
 
         // An on-disk Dockerfile is read from its path, and edits change the
         // fingerprint (the signal a restart uses to decide on a rebuild).
-        let path = std::env::temp_dir()
-            .join(format!("starling-df-fp-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("starling-df-fp-{}", uuid::Uuid::new_v4()));
         std::fs::write(&path, "FROM alpine\n").unwrap();
         let mut on_disk = plain_docker_build("example/web");
         on_disk.dockerfile = Some(path.clone());
@@ -7046,7 +7047,10 @@ spec:
         std::fs::remove_file(&path).ok();
 
         // A custom_build / plain build with no Dockerfile has nothing to compare.
-        assert_eq!(dockerfile_fingerprint(&plain_docker_build("example/web")), None);
+        assert_eq!(
+            dockerfile_fingerprint(&plain_docker_build("example/web")),
+            None
+        );
         // A missing on-disk path degrades to None rather than panicking.
         let mut missing = plain_docker_build("example/web");
         missing.dockerfile = Some(std::path::PathBuf::from("/nope/Dockerfile.absent"));

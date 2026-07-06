@@ -4562,7 +4562,9 @@ mod tests {
             &file,
             format!(
                 "extension_repo(name=\"myrepo\", url=\"file://{}\")\nload(\"ext://myrepo/restart_process\", \"x\")\n",
-                repo.display()
+                // Forward slashes keep the path valid inside a Starlark string
+                // on Windows (backslashes would read as escape sequences).
+                repo.display().to_string().replace('\\', "/")
             ),
         )
         .unwrap();
@@ -6558,8 +6560,10 @@ local_resource("api", serve_cmd="echo ${STARLING_CONTROL_PLANE_POSTGRES_PORT} " 
         assert_eq!(result.port_leases.len(), 1);
         assert_eq!(result.port_leases[0].name, "control-plane-postgres");
         assert_eq!(result.port_leases[0].preferred, Some(54330));
+        // The shell string is the last argv element (`sh -c <s>` on Unix,
+        // `cmd.exe /S /C <s>` on Windows).
         assert_eq!(
-            result.manifests[0].serve_cmd.argv[2],
+            result.manifests[0].serve_cmd.argv.last().unwrap(),
             "echo ${STARLING_CONTROL_PLANE_POSTGRES_PORT} ${STARLING_CONTROL_PLANE_POSTGRES_PORT}"
         );
 
